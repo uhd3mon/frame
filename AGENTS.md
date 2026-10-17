@@ -8,21 +8,26 @@ lessons, checks you actually ran and what they printed).
 
 ## Goal
 
-A Hyprshot-style screenshot tool (region / window / output) that saves a
-PNG and copies it to the clipboard on KDE, GNOME, Hyprland, Sway and X11.
-Reference: https://github.com/Gustash/hyprshot (Bash, GPL-3.0).
+A background screenshot / replay / recording tool driven by global
+shortcuts (region, window, monitor, all, replay, record). Saves to
+`<save_dir>/clip/images` and `/videos`, copies to the clipboard, works on
+KDE, GNOME, Hyprland, Sway and X11. No UI; one config file.
 
 ## Constraints
 
+- MIT licence. All code is our own: do not copy code from Hyprshot or
+  other projects.
 - Plain Bash, one script (`bin/clip`). Call existing tools; do not ship a
-  compiled binary unless the team agrees a portal client is needed.
+  compiled binary unless the team agrees one is needed.
+- One config file, parsed as `key = value` text. Never `source` or eval it.
 - Pick backends at runtime by desktop/session; never assume Hyprland.
-- grim does **not** work on KWin or Mutter ("compositor doesn't support the
-  screen capture protocol"). KDE uses `spectacle -b -n`; GNOME uses
-  gnome-screenshot or the xdg-desktop-portal.
-- Hyprshot is GPL-3.0. Copying its code makes clip GPL-3.0 too. Licence is
-  not chosen yet; ask Kevin before adding a LICENSE or copying code.
-- Tests must not take real screenshots or touch the clipboard by default.
+- grim does **not** work on KWin or Mutter. KDE uses `spectacle -b -n`;
+  GNOME uses gnome-screenshot. Video uses gpu-screen-recorder.
+- Tests must not take real screenshots or recordings, touch the
+  clipboard, send notifications or change real shortcuts. Use
+  `CLIP_DRY_RUN=1`, a temp `CLIP_CONFIG`, temp XDG dirs (incl.
+  `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `TMPDIR`) and the fakes in
+  `tests/smoke.sh` for real-mode runs.
 - Local repo only. Do not add a remote or push without Kevin's OK.
 - No credentials or personal notes in the repo.
 
@@ -30,8 +35,9 @@ Reference: https://github.com/Gustash/hyprshot (Bash, GPL-3.0).
 
 ```
 bin/clip         the tool (executable Bash)
-tests/smoke.sh   smoke tests, no screenshots taken
+tests/smoke.sh   smoke tests, dry-run only
 README.md        user overview
+LICENSE          MIT
 AGENTS.md        rules for agents (CLAUDE.md points here)
 HANDOFF.md       current state and history
 ```
@@ -40,8 +46,11 @@ HANDOFF.md       current state and history
 
 ```sh
 bash -n bin/clip       # syntax check
-bash tests/smoke.sh    # 7 checks, exits 0 on pass
-bin/clip --detect      # shows chosen backends
+bash tests/smoke.sh    # 84 checks, exits 0 on pass (~10 s)
+bin/clip --detect      # shows chosen backends and resolved settings
 ```
 
-shellcheck is not installed on the dev machine; run it if available.
+Functions can be unit-tested by sourcing the script
+(`source bin/clip; qt_keyint Meta+Alt+F12`); `main` only runs when it is
+executed. shellcheck is not installed on the dev machine; run it if
+available.

@@ -1,4 +1,8 @@
 *.png
 *.jpg
+*.webp
+*.mp4
+*.webm
+*.mkv
 .env
 *.local

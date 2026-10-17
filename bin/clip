@@ -1,51 +1,212 @@
 #!/usr/bin/env bash
-# clip - quick screenshots to a file and the clipboard on any Linux desktop.
-# Inspired by Hyprshot (https://github.com/Gustash/hyprshot).
-# Status: skeleton. Backend detection works; capture is not implemented yet.
+# clip - screenshots, replay clips and recordings on any Linux desktop.
+# Runs in the background with global shortcuts; no UI. MIT licence.
 set -euo pipefail
 
-VERSION="0.0.1"
+VERSION="0.1.0"
+CLIP_BIN="$(readlink -f "${BASH_SOURCE[0]}")"
+ACTIONS=(region window monitor all replay record)
+RUNDIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/clip-$UID}/clip"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/clip"
+THUMB_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/clip/thumbs"
+CONFIG="${CLIP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/clip/config}"
+STOP_WAIT="${CLIP_STOP_WAIT:-10}"   # seconds a recorder gets to finish after INT
+[[ "$STOP_WAIT" =~ ^[0-9]+$ ]] || STOP_WAIT=10
+COPIED=0
+TMPD=""
+
+declare -A CFG=(
+    [save_dir]="~/Documents" [image_format]=png [video_format]=mp4
+    [clipboard]=true [notify]=true [replay]=true [replay_seconds]=auto
+    [video_source]=auto [video_fps]=60 [video_quality]=very_high
+    [video_codec]=auto [audio]=default_output
+    [bind.region]=Meta+Alt+R [bind.window]=Meta+Alt+W [bind.monitor]=Meta+Alt+M
+    [bind.all]=Meta+Alt+A [bind.replay]=Meta+Alt+C [bind.record]=Meta+Alt+V
+)
 
 usage() {
     cat <<'EOF'
-Usage: clip [options]
+Usage: clip <command>
 
-Options:
-  -m, --mode MODE      region | window | output (not implemented yet)
-  --clipboard-only     copy to clipboard, do not save a file
-  --detect             print the detected session, desktop and backends
-  -v, --version        print version
-  -h, --help           show this help
+Screenshots:  region | window | monitor | all
+Video:        replay       save the last N seconds of the replay buffer
+              record       start / stop a recording
+Background:   daemon       apply shortcuts and run the replay buffer
+              bind|unbind  add / remove the global shortcuts
+              service on|off   run the daemon as a systemd user service
+Other:        status | config | --detect | --help | --version
 
-Environment:
-  CLIP_DIR             save folder (default: XDG Pictures dir or ~/Pictures)
+Config: ${XDG_CONFIG_HOME:-~/.config}/clip/config (env CLIP_CONFIG overrides).
+CLIP_DRY_RUN=1 prints capture, record, clipboard, notification and bind
+commands instead of running them.
 EOF
 }
 
+die() { echo "clip: $1" >&2; exit "${2:-1}"; }
+warn() { echo "clip: $*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
+dry() { [[ "${CLIP_DRY_RUN:-0}" == 1 ]]; }
+yes_() { [[ "${1,,}" =~ ^(true|yes|on|1)$ ]]; }
+stamp() { date +%Y-%m-%d_%H-%M-%S; }
+
+# Shell-quote only when needed so dry-run output stays readable.
+quote() {
+    local a out=()
+    for a; do
+        if [[ "$a" =~ ^[A-Za-z0-9_./:=+@%,-]+$ ]]; then out+=("$a")
+        else out+=("'${a//\'/\'\\\'\'}'"); fi
+    done
+    echo "${out[*]}"
+}
+
+run() { if dry; then echo "+ $(quote "$@")"; else "$@"; fi; }
+runq() { if dry; then run "$@"; else "$@" >/dev/null; fi; }  # run, hide stdout
+# run_in FILE cmd...: like run, with FILE as stdin.
+run_in() {
+    local f="$1"; shift
+    if dry; then echo "+ $(quote "$@") < $(quote "$f")"; else "$@" <"$f"; fi
+}
+
+# The runtime dir holds pid files and locks. Without XDG_RUNTIME_DIR it
+# lives in /tmp, so make sure nobody else owns or planted it.
+ensure_rundir() {
+    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        local base="${RUNDIR%/clip}"
+        mkdir -m 700 "$base" 2>/dev/null || true
+        [[ -d "$base" && ! -L "$base" && -O "$base" ]] \
+            || die "$base is not a directory owned by you; set XDG_RUNTIME_DIR"
+        chmod 700 "$base"
+    fi
+    mkdir -p "$RUNDIR"
+}
+
+# ---------------------------------------------------------------- config
+
+default_config() {
+    cat <<'EOF'
+# clip config: key = value. # starts a comment at the start of a line or
+# after a space. Values may be quoted. Delete a line to use its default.
+# Only ~ and ~/ are expanded; $VARS are not.
+
+save_dir = ~/Documents     # files go to <save_dir>/clip/images and /clip/videos
+image_format = png         # png | jpg | webp
+video_format = mp4         # mp4 | webm | mkv
+clipboard = true           # copy each capture to the clipboard
+notify = true              # notification with a preview (notify-send)
+
+replay = true              # keep a replay buffer running in the daemon
+replay_seconds = auto      # 5-1800; auto = 60 with >= 8 GiB free RAM, else 30
+video_source = auto        # auto = focused/first monitor, or DP-1, portal, screen...
+video_fps = 60             # 1-240
+video_quality = very_high  # medium | high | very_high | ultra
+video_codec = auto         # auto = best the GPU encodes (av1 > hevc > h264)
+audio = default_output     # gpu-screen-recorder -a value, or none
+
+# Shortcuts use KDE-style names: Meta, Ctrl, Alt, Shift + one key (a-z, 0-9,
+# F1-F35, Print, Space, Home, ...). Empty = none.
+bind.region = Meta+Alt+R
+bind.window = Meta+Alt+W
+bind.monitor = Meta+Alt+M
+bind.all = Meta+Alt+A
+bind.replay = Meta+Alt+C
+bind.record = Meta+Alt+V
+EOF
+}
+
+# Parse key = value lines. The file is never sourced or evaluated.
+load_config() {
+    local line key val n=0
+    if [[ -f "$CONFIG" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            n=$((n + 1))
+            [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+            line="${line%%[[:space:]]#*}"   # a comment starts at " #"
+            if [[ ! "$line" =~ ^[[:space:]]*([a-z_.]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]])?[[:space:]]*$ ]]; then
+                warn "$CONFIG:$n: ignored (expected key = value)"; continue
+            fi
+            key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+            if [[ "$val" =~ ^\"(.*)\"$ || "$val" =~ ^\'(.*)\'$ ]]; then val="${BASH_REMATCH[1]}"; fi
+            if [[ -z "${CFG[$key]+x}" ]]; then warn "$CONFIG:$n: unknown key '$key'"; continue; fi
+            CFG[$key]="$val"
+        done <"$CONFIG"
+    fi
+    validate_config
+}
+
+int_in() { [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= $2 && 10#$1 <= $3)); }
+
+validate_config() {
+    local a k
+    [[ "${CFG[image_format]}" =~ ^(png|jpg|webp)$ ]] || die "image_format must be png, jpg or webp" 2
+    [[ "${CFG[video_format]}" =~ ^(mp4|webm|mkv)$ ]] || die "video_format must be mp4, webm or mkv" 2
+    for k in clipboard notify replay; do
+        [[ "${CFG[$k],,}" =~ ^(true|false|yes|no|on|off|1|0)$ ]] || die "$k must be true or false" 2
+    done
+    [[ "${CFG[replay_seconds]}" == auto ]] || int_in "${CFG[replay_seconds]}" 5 1800 \
+        || die "replay_seconds must be auto or 5-1800" 2
+    int_in "${CFG[video_fps]}" 1 240 || die "video_fps must be 1-240" 2
+    [[ "${CFG[video_quality]}" =~ ^(medium|high|very_high|ultra)$ ]] \
+        || die "video_quality must be medium, high, very_high or ultra" 2
+    [[ "${CFG[video_codec]}" =~ ^(auto|h264|hevc|av1|vp8|vp9|hevc_hdr|av1_hdr|hevc_10bit|av1_10bit)$ ]] \
+        || die "video_codec must be auto, h264, hevc, av1, vp8 or vp9 (or hevc/av1 _hdr/_10bit)" 2
+    if [[ "${CFG[video_format]}" == webm && ! "${CFG[video_codec]}" =~ ^(auto|av1|vp8|vp9)$ ]]; then
+        die "webm needs video_codec auto, av1, vp8 or vp9" 2
+    fi
+    [[ "$(expand_dir "${CFG[save_dir]}")" == /* ]] \
+        || die "save_dir must be an absolute path or start with ~/ (got '${CFG[save_dir]}')" 2
+    for a in "${ACTIONS[@]}"; do
+        k="${CFG[bind.$a]}"
+        [[ -z "$k" ]] || parse_shortcut "$k" || die "bind.$a: '$k' is not a shortcut (example: Meta+Alt+R)" 2
+    done
+}
+
+# Only ~ and ~/... are expanded (not ~user, not $VARS).
+expand_dir() {
+    local d="$1"
+    if [[ "$d" == "~" ]]; then d="$HOME"; elif [[ "$d" == "~/"* ]]; then d="$HOME/${d#\~/}"; fi
+    echo "$d"
+}
+save_root() { echo "$(expand_dir "${CFG[save_dir]}")/clip"; }
+images_dir() { echo "$(save_root)/images"; }
+videos_dir() { echo "$(save_root)/videos"; }
+
+cmd_config() {
+    if [[ ! -f "$CONFIG" ]]; then
+        mkdir -p "$(dirname "$CONFIG")"
+        default_config >"$CONFIG"
+    fi
+    echo "$CONFIG"
+}
+
+# Unused name in DIR for ACTION.EXT (adds -2, -3 within the same second).
+new_file() {
+    local dir="$1" action="$2" ext="$3" base i=2 f
+    base="$dir/$(stamp)_$action"; f="$base.$ext"
+    while [[ -e "$f" ]]; do f="$base-$i.$ext"; i=$((i + 1)); done
+    echo "$f"
+}
+
+# --------------------------------------------------------------- detection
 
 session_type() { echo "${XDG_SESSION_TYPE:-unknown}"; }
 
 desktop() {
-    if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then echo hyprland; return; fi
-    local d="${XDG_CURRENT_DESKTOP:-unknown}"
-    echo "${d,,}"
+    local d="${XDG_CURRENT_DESKTOP:-}"; d="${d,,}"
+    if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" || "$d" == *hyprland* ]]; then echo hyprland
+    elif [[ -n "${SWAYSOCK:-}" || "$d" == *sway* ]]; then echo sway
+    elif [[ "$d" == *kde* ]]; then echo kde
+    elif [[ "$d" == *gnome* ]]; then echo gnome
+    else echo "${d:-unknown}"; fi
 }
 
-# Capture backend. grim only works on wlroots-style compositors (Hyprland,
-# Sway); KWin and Mutter reject it, so KDE uses Spectacle.
+# grim only works on wlroots compositors; KWin and Mutter reject it.
 capture_backend() {
-    local s d
-    s="$(session_type)"; d="$(desktop)"
-    case "$d" in
-        hyprland|sway|river|wlroots)
-            have grim && { echo grim; return; } ;;
-        *kde*)
-            have spectacle && { echo spectacle; return; } ;;
-        *gnome*)
-            have gnome-screenshot && { echo gnome-screenshot; return; } ;;
+    case "$(desktop)" in
+        hyprland|sway) have grim && { echo grim; return; } ;;
+        kde) have spectacle && { echo spectacle; return; } ;;
+        gnome) have gnome-screenshot && { echo gnome-screenshot; return; } ;;
     esac
-    if [[ "$s" == x11 ]]; then
+    if [[ "$(session_type)" == x11 ]]; then
         have maim && { echo maim; return; }
         have import && { echo import; return; }
     fi
@@ -53,47 +214,816 @@ capture_backend() {
 }
 
 clipboard_backend() {
-    if [[ "$(session_type)" == wayland ]] && have wl-copy; then echo wl-copy; return; fi
-    have xclip && { echo xclip; return; }
-    have xsel && { echo xsel; return; }
-    echo none
+    if [[ "$(session_type)" == wayland ]] && have wl-copy; then echo wl-copy
+    elif have xclip; then echo xclip
+    else echo none; fi
 }
 
-save_dir() {
-    if [[ -n "${CLIP_DIR:-}" ]]; then echo "$CLIP_DIR"; return; fi
-    if have xdg-user-dir; then xdg-user-dir PICTURES; return; fi
-    echo "$HOME/Pictures"
+video_backend() {
+    if have gpu-screen-recorder; then echo gpu-screen-recorder
+    elif [[ "$(session_type)" == x11 ]] && have ffmpeg; then echo ffmpeg
+    else echo none; fi
 }
 
-detect() {
+bind_backend() {
+    case "$(desktop)" in kde|hyprland|sway|gnome) desktop ;; *) echo manual ;; esac
+}
+
+replay_seconds() {
+    local s="${CFG[replay_seconds]}" kb
+    if [[ "$s" == auto ]]; then
+        kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+        if (( ${kb:-0} >= 8 * 1024 * 1024 )); then s=60; else s=30; fi
+    fi
+    echo "$s"
+}
+
+video_source() {
+    local s="${CFG[video_source]}"
+    [[ "$s" != auto ]] && { echo "$s"; return; }
+    case "$(desktop)" in
+        hyprland) s="$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null || true)" ;;
+        sway) s="$(swaymsg -t get_outputs 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null || true)" ;;
+        *) s="" ;;
+    esac
+    if [[ -z "$s" ]] && have gpu-screen-recorder; then
+        s="$(gpu-screen-recorder --list-monitors 2>/dev/null | head -n1 | cut -d'|' -f1 || true)"
+    fi
+    echo "${s:-screen}"
+}
+
+# pick_codec CONTAINER CODEC_LIST: best size/quality codec the GPU encodes.
+pick_codec() {
+    local fmt="$1" list="$2" c prefs=(av1 hevc h264)
+    [[ "$fmt" == webm ]] && prefs=(av1 vp9 vp8)
+    for c in "${prefs[@]}"; do
+        grep -qx "$c" <<<"$list" && { echo "$c"; return; }
+    done
+    echo auto
+}
+
+video_codec() {
+    local c="${CFG[video_codec]}" list=""
+    [[ "$c" != auto ]] && { echo "$c"; return; }
+    have gpu-screen-recorder && list="$(gpu-screen-recorder --info 2>/dev/null \
+        | sed -n '/^section=video_codecs/,/^section=/p' | grep -v '^section=' || true)"
+    pick_codec "${CFG[video_format]}" "$list"
+}
+
+cmd_detect() {
     echo "session=$(session_type)"
     echo "desktop=$(desktop)"
     echo "capture=$(capture_backend)"
     echo "clipboard=$(clipboard_backend)"
-    echo "save_dir=$(save_dir)"
+    echo "video=$(video_backend)"
+    echo "binds=$(bind_backend)"
+    echo "config=$CONFIG"
+    echo "images=$(images_dir)"
+    echo "videos=$(videos_dir)"
+    echo "replay_seconds=$(replay_seconds)"
+    echo "video_source=$(video_source)"
+    echo "video_codec=$(video_codec)"
 }
 
-main() {
-    local mode="" clipboard_only=0
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -h|--help) usage; return 0 ;;
-            -v|--version) echo "clip $VERSION"; return 0 ;;
-            --detect) detect; return 0 ;;
-            -m|--mode) mode="${2:-}"; shift ;;
-            --clipboard-only) clipboard_only=1 ;;
-            *) echo "clip: unknown option: $1" >&2; usage >&2; return 2 ;;
-        esac
-        shift
-    done
-    if [[ -z "$mode" ]]; then usage >&2; return 2; fi
-    case "$mode" in
-        region|window|output) ;;
-        *) echo "clip: unknown mode: $mode" >&2; return 2 ;;
+# ------------------------------------------------------------ clipboard etc
+
+mime_of() {
+    case "${1##*.}" in
+        png) echo image/png ;; jpg) echo image/jpeg ;; webp) echo image/webp ;;
+        *) echo text/uri-list ;;
     esac
-    : "$clipboard_only"
-    echo "clip: capture is not implemented yet (mode=$mode)" >&2
+}
+
+is_video() { [[ "${1##*.}" =~ ^(mp4|webm|mkv)$ ]]; }
+
+# Percent-encode byte by byte, so UTF-8 names (Документы, é) come out right.
+urlencode() {
+    local LC_ALL=C s="$1" out="" c i
+    for ((i = 0; i < ${#s}; i++)); do
+        c="${s:i:1}"
+        if [[ "$c" =~ [A-Za-z0-9/._~-] ]]; then out+="$c"; else out+="$(printf '%%%02X' "'$c")"; fi
+    done
+    echo "$out"
+}
+file_uri() { echo "file://$(urlencode "$1")"; }
+
+# Images go in as image data; videos as a file:// URI so they paste as files.
+copy_file() {
+    local f="$1" mime
+    yes_ "${CFG[clipboard]}" || return 0
+    mime="$(mime_of "$f")"
+    case "$(clipboard_backend):$mime" in
+        wl-copy:text/uri-list) run wl-copy --type text/uri-list "$(file_uri "$f")" ;;
+        xclip:text/uri-list)
+            if dry; then echo "+ xclip -selection clipboard -t text/uri-list <<< $(file_uri "$f")"
+            else xclip -selection clipboard -t text/uri-list <<<"$(file_uri "$f")"; fi ;;
+        wl-copy:*) run_in "$f" wl-copy --type "$mime" ;;
+        xclip:*) run xclip -selection clipboard -t "$mime" -i "$f" ;;
+        *) warn "no clipboard tool (install wl-clipboard or xclip)"; return 0 ;;
+    esac
+    COPIED=1
+}
+
+# ----------------------------------------------------------- notifications
+
+# Plain notification (no preview), e.g. "Recording started".
+notify() {
+    yes_ "${CFG[notify]}" && have notify-send || return 0
+    run notify-send -a clip -i "${3:-camera-photo}" "$1" "$2" || true
+}
+
+notify_error() {
+    yes_ "${CFG[notify]}" && have notify-send || return 0
+    run notify-send -a clip -u critical -i dialog-error "clip" "$1" || true
+}
+
+# fail MSG: tell the user (the shortcut has no terminal), then exit 1.
+fail() { notify_error "$1"; die "$1"; }
+
+markup() { local s="${1//&/"&amp;"}"; s="${s//</"&lt;"}"; echo "${s//>/"&gt;"}"; }
+
+# video_thumb FILE: print a PNG of a frame ~1 s in, 512 px wide.
+video_thumb() {
+    local f="$1" t
+    t="$THUMB_DIR/$(basename "${f%.*}").png"
+    if dry; then run ffmpeg -loglevel error -y -ss 1 -i "$f" -frames:v 1 -vf scale=512:-2 "$t" >&2; echo "$t"; return; fi
+    have ffmpeg || return 1
+    mkdir -p "$THUMB_DIR"
+    find "$THUMB_DIR" -type f -mtime +7 -delete 2>/dev/null || true
+    ffmpeg -loglevel error -y -ss 1 -i "$f" -frames:v 1 -vf scale=512:-2 "$t" </dev/null 2>/dev/null || true
+    [[ -s "$t" ]] || ffmpeg -loglevel error -y -i "$f" -frames:v 1 -vf scale=512:-2 "$t" </dev/null 2>/dev/null || true
+    [[ -s "$t" ]] && echo "$t"
+}
+
+show_in_folder() {
+    gdbus call --session -d org.freedesktop.FileManager1 -o /org/freedesktop/FileManager1 \
+        -m org.freedesktop.FileManager1.ShowItems "['$(file_uri "$1")']" "" >/dev/null 2>&1 \
+        || xdg-open "$(dirname "$1")" >/dev/null 2>&1 || true
+}
+
+# notify_saved FILE TITLE: toast with a preview and Open / Show in folder.
+# It waits for a button press, so it runs detached from the shortcut.
+notify_saved() {
+    yes_ "${CFG[notify]}" && have notify-send || return 0
+    if dry; then toast "$1" "$2" "$COPIED"; return 0; fi
+    setsid -f "$CLIP_BIN" _toast "$1" "$2" "$COPIED" </dev/null >/dev/null 2>&1 || true
+}
+
+# toast FILE TITLE COPIED. KDE gets x-kde-urls (thumbnail you can drag out,
+# like Spectacle); other servers get the image as image-path. Plasma has no
+# video thumbnailer by default, so videos also get our own frame there.
+toast() {
+    local f="$1" title="$2" body thumb="" icon=camera-photo reply args=(-a clip)
+    body="$(markup "${f##*/}")"
+    [[ "${3:-0}" == 1 ]] && body+=$'\nCopied to clipboard'
+    if is_video "$f"; then icon=video-x-generic; thumb="$(video_thumb "$f")" || thumb=""
+    else thumb="$f"; fi
+    if [[ "$(desktop)" == kde ]]; then
+        args+=(-i "$icon" -h "string:x-kde-urls:$(file_uri "$f")")
+        is_video "$f" && [[ -n "$thumb" ]] && args+=(-h "string:image-path:$thumb")
+    elif [[ -n "$thumb" ]]; then args+=(-h "string:image-path:$thumb")
+    else args+=(-i "$icon"); fi
+    grep -q -- --action <<<"$(notify-send --help 2>&1)" && args+=(-A open=Open -A "folder=Show in folder")
+    args+=("$title" "$body")
+    if dry; then run notify-send "${args[@]}"; return 0; fi
+    reply="$(timeout 30m notify-send "${args[@]}" 2>/dev/null)" || true
+    case "$reply" in
+        open) xdg-open "$f" >/dev/null 2>&1 || true ;;
+        folder) show_in_folder "$f" ;;
+    esac
+}
+
+# --------------------------------------------------------------- screenshots
+
+# Geometry helpers for grim ("X,Y WxH"); placeholders in dry-run.
+window_geom() {
+    dry && { echo "X,Y WxH"; return; }
+    case "$(desktop)" in
+        hyprland) hyprctl activewindow -j | jq -r '"\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"' ;;
+        sway) swaymsg -t get_tree | jq -r '.. | select(.focused? == true) | .rect | "\(.x),\(.y) \(.width)x\(.height)"' | head -n1 ;;
+    esac
+}
+
+focused_output() {
+    dry && { echo OUTPUT; return; }
+    case "$(desktop)" in
+        hyprland) hyprctl monitors -j | jq -r '.[] | select(.focused) | .name' ;;
+        sway) swaymsg -t get_outputs | jq -r '.[] | select(.focused) | .name' ;;
+    esac
+}
+
+capture() {
+    local mode="$1" out="$2" g
+    case "$(capture_backend)" in
+        spectacle)
+            local flag; case "$mode" in region) flag=-r ;; window) flag=-a ;; monitor) flag=-m ;; all) flag=-f ;; esac
+            run spectacle -b -n "$flag" -o "$out" ;;
+        grim)
+            case "$mode" in
+                region) if dry; then run grim -g '$(slurp)' "$out"
+                        else g="$(slurp)" || return 1; grim -g "$g" "$out"; fi ;;
+                window) g="$(window_geom)"; [[ -n "$g" ]] || return 1; run grim -g "$g" "$out" ;;
+                monitor) run grim -o "$(focused_output)" "$out" ;;
+                all) run grim "$out" ;;
+            esac ;;
+        gnome-screenshot)
+            case "$mode" in
+                region) run gnome-screenshot -a -f "$out" ;;
+                window) run gnome-screenshot -w -f "$out" ;;
+                *) run gnome-screenshot -f "$out" ;;  # no per-monitor mode: monitor = all
+            esac ;;
+        maim)
+            case "$mode" in
+                region) run maim -s "$out" ;;
+                window) if dry; then run maim -i '$(xdotool getactivewindow)' "$out"
+                        else maim -i "$(xdotool getactivewindow)" "$out"; fi ;;
+                *) run maim "$out" ;;
+            esac ;;
+        import)
+            case "$mode" in
+                region) run import "$out" ;;
+                window) if dry; then run import -window '$(xdotool getactivewindow)' "$out"
+                        else import -window "$(xdotool getactivewindow)" "$out"; fi ;;
+                *) run import -window root "$out" ;;
+            esac ;;
+        *) fail "no screenshot tool for $(desktop)/$(session_type); see clip --detect" ;;
+    esac
+}
+
+cmd_shot() {
+    local mode="$1" fmt="${CFG[image_format]}" dir tmp dest
+    dir="$(images_dir)"; mkdir -p "$dir"
+    TMPD="$(mktemp -d --tmpdir clip.XXXXXX)"
+    trap 'rm -rf "$TMPD"' EXIT
+    tmp="$TMPD/shot.png"
+    capture "$mode" "$tmp" || true
+    if ! dry && [[ ! -s "$tmp" ]]; then echo "clip: cancelled" >&2; exit 1; fi
+    dest="$(new_file "$dir" "$mode" "$fmt")"
+    case "$fmt" in
+        png) run mv "$tmp" "$dest" ;;
+        jpg) run ffmpeg -loglevel error -y -i "$tmp" -q:v 2 "$dest" ;;
+        webp) run ffmpeg -loglevel error -y -i "$tmp" -c:v libwebp -quality 90 "$dest" ;;
+    esac
+    copy_file "$dest"
+    notify_saved "$dest" "Screenshot saved"
+    echo "$dest"
+}
+
+# ------------------------------------------------------------------- video
+
+# Pid files hold "PID STARTTIME" so a stale file never signals a reused PID.
+proc_start() {  # start time of PID: field 22 of /proc/PID/stat
+    local s f
+    s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+    s="${s##*") "}"; read -ra f <<<"$s"
+    echo "${f[19]}"
+}
+
+gone() {  # PID has exited (or is a zombie)
+    local s
+    s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+    s="${s##*") "}"; [[ "${s:0:1}" == Z ]]
+}
+
+write_pid() {  # write_pid FILE PID [extra lines...]
+    local f="$1" pid="$2"; shift 2
+    { echo "$pid $(proc_start "$pid" || true)"; for l; do echo "$l"; done; } >"$f"
+}
+
+live_pid() {  # print the PID in FILE if that same process still runs
+    local pid start
+    [[ -f "$1" ]] || return 1
+    read -r pid start _ <"$1" || return 1
+    [[ "$pid" =~ ^[0-9]+$ && -n "$start" ]] || return 1
+    [[ "$(proc_start "$pid")" == "$start" ]] || return 1
+    echo "$pid"
+}
+
+# gpu-screen-recorder runs this after each save: path, type.
+write_hook() {
+    ensure_rundir
+    printf '#!/bin/sh\nexec %s _saved "$@"\n' "$(quote "$CLIP_BIN")" >"$RUNDIR/hook"
+    chmod +x "$RUNDIR/hook"
+}
+
+gsr_args() {  # common gsr options for the configured source and quality
+    local args=(-w "$(video_source)" -c "${CFG[video_format]}" -k "$(video_codec)"
+        -f "${CFG[video_fps]}" -q "${CFG[video_quality]}" -sc "$RUNDIR/hook")
+    [[ "${CFG[audio]}" != none && -n "${CFG[audio]}" ]] && args+=(-a "${CFG[audio]}")
+    printf '%s\n' "${args[@]}"
+}
+
+ffmpeg_args() {  # ffmpeg_args FILE: X11 fallback recorder, one arg per line
+    local audio=0 args=(ffmpeg -loglevel error -f x11grab -framerate "${CFG[video_fps]}" -i "${DISPLAY:-:0}")
+    if [[ "${CFG[audio]}" != none && -n "${CFG[audio]}" ]]; then args+=(-f pulse -i @DEFAULT_MONITOR@); audio=1; fi
+    case "${CFG[video_format]}" in
+        webm) args+=(-c:v libvpx-vp9 -crf 32 -b:v 0 -deadline realtime -cpu-used 8 -row-mt 1)
+              ((audio)) && args+=(-c:a libopus -b:a 128k) ;;
+        *) args+=(-c:v libx264 -crf 20 -preset veryfast -pix_fmt yuv420p)
+           ((audio)) && args+=(-c:a aac -b:a 160k) ;;
+    esac
+    printf '%s\n' "${args[@]}" "$1"
+}
+
+# Hook target: give replays our name, then copy and notify.
+cmd_saved() {
+    local f="$1" type="${2:-regular}" dest secs
+    [[ -f "$f" ]] || dry || fail "saved file not found: $f"
+    if [[ "$type" == replay ]]; then
+        dest="$(new_file "$(videos_dir)" replay "${f##*.}")"
+        run mv "$f" "$dest"; f="$dest"
+        secs="$(sed -n 2p "$RUNDIR/replay.pid" 2>/dev/null || true)"
+    fi
+    copy_file "$f"
+    if [[ "$type" == replay ]]; then notify_saved "$f" "Clip saved (${secs:-$(replay_seconds)} s)"
+    else notify_saved "$f" "Recording saved"; fi
+}
+
+cmd_replay() {
+    local pid
+    if pid="$(live_pid "$RUNDIR/replay.pid")"; then run kill -USR1 "$pid"
+    elif dry; then echo "+ kill -USR1 <replay pid>"
+    else fail "replay buffer is not running (start it with: clip daemon, or clip service on)"; fi
+}
+
+# stop_recorder PID: INT, then TERM after STOP_WAIT s; fails if still alive.
+stop_recorder() {
+    local pid="$1" i
+    if dry; then echo "+ kill -INT $pid"; return 0; fi
+    kill -INT "$pid" 2>/dev/null || true
+    for ((i = 0; i < STOP_WAIT * 10; i++)); do gone "$pid" && return 0; sleep 0.1; done
+    warn "recorder did not stop after ${STOP_WAIT}s; sending TERM"
+    kill -TERM "$pid" 2>/dev/null || true
+    for ((i = 0; i < 20; i++)); do gone "$pid" && return 0; sleep 0.1; done
     return 1
 }
 
-main "$@"
+cmd_record() {
+    local pidf="$RUNDIR/record.pid" pid f kind cmd
+    ensure_rundir
+    exec 9>"$RUNDIR/record.lock"
+    flock -n 9 || die "clip record is already starting or stopping"
+    if pid="$(live_pid "$pidf")"; then
+        { read -r _; read -r f; read -r kind; } <"$pidf"
+        stop_recorder "$pid" || fail "recorder (pid $pid) is still running; kept $pidf"
+        rm -f "$pidf"
+        dry || [[ -s "$f" ]] || fail "recording failed, $f is empty (see $RUNDIR/record.log)"
+        [[ "$kind" == ffmpeg ]] && cmd_saved "$f" regular   # gsr calls the hook itself
+        echo "$f"; return
+    fi
+    mkdir -p "$(videos_dir)"
+    f="$(new_file "$(videos_dir)" record "${CFG[video_format]}")"
+    case "$(video_backend)" in
+        gpu-screen-recorder)
+            write_hook; kind=gsr
+            mapfile -t cmd < <(gsr_args); cmd=(gpu-screen-recorder "${cmd[@]}" -o "$f") ;;
+        ffmpeg) kind=ffmpeg; mapfile -t cmd < <(ffmpeg_args "$f") ;;
+        *) fail "recording needs gpu-screen-recorder (or ffmpeg on X11)" ;;
+    esac
+    if dry; then run "${cmd[@]}"; return; fi
+    "${cmd[@]}" </dev/null >>"$RUNDIR/record.log" 2>&1 9>&- &
+    pid=$!; disown
+    write_pid "$pidf" "$pid" "$f" "$kind"
+    sleep 1
+    live_pid "$pidf" >/dev/null || { rm -f "$pidf"; fail "recorder exited; see $RUNDIR/record.log"; }
+    notify "Recording started" "Press ${CFG[bind.record]:-clip record} again to stop" media-record
+    echo "recording to $f (run clip record again to stop)"
+}
+
+replay_cmd() {  # one argument per line
+    printf '%s\n' gpu-screen-recorder
+    gsr_args
+    printf '%s\n' -r "$(replay_seconds)" -replay-storage ram -o "$(videos_dir)"
+}
+
+# Foreground: apply shortcuts, keep the replay buffer alive, exit on TERM.
+cmd_daemon() {
+    local gpid="" spid="" stop=0 cmd secs
+    ensure_rundir
+    mkdir -p "$(videos_dir)" "$(images_dir)"
+    exec 8>"$RUNDIR/daemon.lock"
+    flock -n 8 || die "daemon already running (pid $(live_pid "$RUNDIR/daemon.pid" || echo '?'))"
+    cmd_bind || warn "could not apply shortcuts"
+    if yes_ "${CFG[replay]}" && [[ "$(video_backend)" != gpu-screen-recorder ]]; then
+        warn "replay buffer needs gpu-screen-recorder; replay disabled"; CFG[replay]=false
+    fi
+    mapfile -t cmd < <(replay_cmd)
+    secs="$(replay_seconds)"
+    if dry; then yes_ "${CFG[replay]}" && run "${cmd[@]}"; return 0; fi
+    write_pid "$RUNDIR/daemon.pid" $$
+    daemon_stop() {
+        stop=1
+        if [[ -n "$gpid" ]]; then kill -INT "$gpid" 2>/dev/null || true; fi
+        if [[ -n "$spid" ]]; then kill "$spid" 2>/dev/null || true; fi
+    }
+    trap daemon_stop TERM INT
+    write_hook
+    while ((!stop)); do
+        if yes_ "${CFG[replay]}"; then
+            "${cmd[@]}" </dev/null 8>&- &
+            gpid=$!; write_pid "$RUNDIR/replay.pid" "$gpid" "$secs"
+            echo "clip: replay buffer running (${secs}s, pid $gpid)"
+            wait "$gpid" || true
+            ((stop)) && break
+            rm -f "$RUNDIR/replay.pid"; gpid=""
+            warn "replay buffer exited; restarting in 5s"
+        fi
+        sleep 5 8>&- & spid=$!
+        wait "$spid" || true
+        spid=""
+    done
+    if [[ -n "$gpid" ]]; then wait "$gpid" 2>/dev/null || true; fi
+    rm -f "$RUNDIR/replay.pid" "$RUNDIR/daemon.pid"
+    echo "clip: daemon stopped"
+}
+
+# ------------------------------------------------------------------- binds
+
+# key_info KEY -> "QT_KEYCODE XKB_KEYSYM"; fails for keys we don't know.
+key_info() {
+    local k="${1,,}" n
+    case "$k" in
+        esc|escape) echo "$((0x01000000)) Escape" ;;
+        tab) echo "$((0x01000001)) Tab" ;;
+        backspace) echo "$((0x01000003)) BackSpace" ;;
+        return|enter) echo "$((0x01000004)) Return" ;;
+        ins|insert) echo "$((0x01000006)) Insert" ;;
+        del|delete) echo "$((0x01000007)) Delete" ;;
+        pause) echo "$((0x01000008)) Pause" ;;
+        print) echo "$((0x01000009)) Print" ;;
+        home) echo "$((0x01000010)) Home" ;;
+        end) echo "$((0x01000011)) End" ;;
+        left) echo "$((0x01000012)) Left" ;;
+        up) echo "$((0x01000013)) Up" ;;
+        right) echo "$((0x01000014)) Right" ;;
+        down) echo "$((0x01000015)) Down" ;;
+        pgup|pageup) echo "$((0x01000016)) Prior" ;;
+        pgdown|pagedown) echo "$((0x01000017)) Next" ;;
+        space) echo "32 space" ;;
+        f[1-9]|f[12][0-9]|f3[0-5]) n="${k:1}"; echo "$((0x01000030 + n - 1)) F$n" ;;
+        [abcdefghijklmnopqrstuvwxyz0123456789]) echo "$(printf '%d' "'${k^^}") $k" ;;
+        *) return 1 ;;
+    esac
+}
+
+# parse_shortcut "Meta+Alt+R": sets SC_MODS (meta ctrl alt shift) and
+# SC_KEY. Fails unless every part is a modifier or a known key, with
+# exactly one key. This is also what keeps config text out of commands.
+parse_shortcut() {
+    local s="${1//[[:space:]]/}" part parts
+    SC_MODS=(); SC_KEY=""
+    [[ -n "$s" && "$s" != *+ ]] || return 1   # read drops a trailing empty part
+    IFS='+' read -ra parts <<<"$s"
+    for part in "${parts[@]}"; do
+        case "${part,,}" in
+            meta|super|win) SC_MODS+=(meta) ;;
+            ctrl|control) SC_MODS+=(ctrl) ;;
+            alt) SC_MODS+=(alt) ;;
+            shift) SC_MODS+=(shift) ;;
+            *) [[ -z "$SC_KEY" ]] && key_info "$part" >/dev/null || return 1
+               SC_KEY="$part" ;;
+        esac
+    done
+    [[ -n "$SC_KEY" ]]
+}
+
+# Qt key code for a KDE-style shortcut, e.g. Meta+Alt+F12 -> 419430459.
+qt_keyint() {
+    local m mods=0 k
+    parse_shortcut "$1" || return 1
+    for m in "${SC_MODS[@]}"; do
+        case $m in
+            meta) mods=$((mods | 0x10000000)) ;; ctrl) mods=$((mods | 0x04000000)) ;;
+            alt) mods=$((mods | 0x08000000)) ;; shift) mods=$((mods | 0x02000000)) ;;
+        esac
+    done
+    k="$(key_info "$SC_KEY")"
+    echo $((mods | ${k%% *}))
+}
+
+# bind_combo STYLE SHORTCUT -> combo in that desktop's syntax.
+bind_combo() {
+    local style="$1" m key out=()
+    parse_shortcut "$2" || return 1
+    for m in "${SC_MODS[@]}"; do
+        case $style:$m in
+            hypr:meta) out+=(SUPER) ;; hypr:ctrl) out+=(CTRL) ;; hypr:alt) out+=(ALT) ;; hypr:shift) out+=(SHIFT) ;;
+            sway:meta) out+=(Mod4) ;; sway:ctrl) out+=(Control) ;; sway:alt) out+=(Mod1) ;; sway:shift) out+=(Shift) ;;
+            gnome:meta) out+=("<Super>") ;; gnome:ctrl) out+=("<Ctrl>") ;; gnome:alt) out+=("<Alt>") ;; gnome:shift) out+=("<Shift>") ;;
+        esac
+    done
+    key="$(key_info "$SC_KEY")"; key="${key#* }"
+    case $style in
+        hypr) echo "${out[*]}, $key" ;;
+        sway) local IFS=+; echo "${out[*]}${out:++}$key" ;;
+        gnome) local IFS=; echo "${out[*]}$key" ;;
+    esac
+}
+
+# Bound shortcuts are recorded per backend in $STATE_DIR/binds as
+# "backend action shortcut", so unbind removes what we set, not what the
+# config says now. KDE and GNOME binds survive a reboot, hence not /run.
+state_file() { echo "$STATE_DIR/binds"; }
+state_get() {  # state_get BACKEND -> "action shortcut" lines
+    [[ -f "$(state_file)" ]] || return 0
+    awk -v b="$1" '$1 == b { sub(/^[^ ]+ /, ""); print }' "$(state_file)"
+}
+state_save() {  # state_save BACKEND "action shortcut"...
+    local be="$1" f p; shift; f="$(state_file)"
+    if dry; then echo "+ save $f: $be ${*:-(none)}"; return 0; fi
+    mkdir -p "$STATE_DIR"
+    {
+        if [[ -f "$f" ]]; then awk -v b="$be" '$1 != b' "$f"; fi
+        for p; do echo "$be $p"; done
+    } >"$f.tmp"
+    mv "$f.tmp" "$f"
+}
+
+# Quoting for the places that run our path: a desktop-entry Exec= argument
+# (\ " ` $ escaped in double quotes, then key-file \ doubling, % as %%),
+# the systemd ExecStart= program, and a GVariant string for gsettings.
+desktop_arg() {
+    local s="${1//\\/"\\\\"}"
+    s="${s//\"/"\\\""}"; s="${s//\`/"\\\`"}"; s="${s//\$/"\\\$"}"
+    s="\"$s\""; s="${s//\\/"\\\\"}"
+    echo "${s//%/"%%"}"
+}
+systemd_arg() {  # for the program path only: systemd never expands $ there
+    local s="${1//\\/"\\\\"}"
+    s="${s//\"/"\\\""}"
+    echo "\"${s//%/"%%"}\""
+}
+gv_str() { local s="${1//\\/"\\\\"}"; echo "'${s//\'/"\\'"}'"; }
+
+kde_id() { echo "[\"clip-$1.desktop\",\"_launch\",\"clip $1\",\"clip $1\"]"; }
+kde_desktop() { echo "${XDG_DATA_HOME:-$HOME/.local/share}/applications/clip-$1.desktop"; }
+kglobal() { runq gdbus call --session -d org.kde.kglobalaccel -o /kglobalaccel -m "org.kde.KGlobalAccel.$1" "${@:2}"; }
+
+kde_bind() {  # kde_bind ACTION SHORTCUT
+    local a="$1" want got d
+    want="$(qt_keyint "$2")"; d="$(kde_desktop "$a")"
+    if dry; then echo "+ write $d (Exec=$(desktop_arg "$CLIP_BIN") $a)"
+    else
+        mkdir -p "$(dirname "$d")"
+        printf '[Desktop Entry]\nType=Application\nName=clip %s\nExec=%s %s\nNoDisplay=true\nX-KDE-GlobalAccel-CommandShortcut=true\n' \
+            "$a" "$(desktop_arg "$CLIP_BIN")" "$a" >"$d"
+    fi
+    kglobal doRegister "$(kde_id "$a")"
+    if dry; then kglobal setShortcut "$(kde_id "$a")" "[$want]" 4; return 0; fi
+    # KGlobalAccel answers with the keys it really set; a taken combo comes back empty.
+    got="$(gdbus call --session -d org.kde.kglobalaccel -o /kglobalaccel \
+        -m org.kde.KGlobalAccel.setShortcut "$(kde_id "$a")" "[$want]" 4 2>/dev/null || true)"
+    [[ "$got" == *"[$want]"* ]] && return 0
+    warn "shortcut $2 taken, not bound ($a)"
+    kde_unbind "$a"
+    return 1
+}
+
+kde_unbind() {  # kde_unbind ACTION [SHORTCUT]
+    kglobal setShortcut "$(kde_id "$1")" '[]' 4 || true
+    kglobal unregister "clip-$1.desktop" _launch || true
+    run rm -f "$(kde_desktop "$1")"
+}
+
+# hypr_owner SHORTCUT -> free | ours | taken (per `hyprctl binds -j`).
+hypr_owner() {
+    local m mask=0 key json
+    have hyprctl && have jq || { echo free; return; }
+    parse_shortcut "$1" || { echo free; return; }
+    for m in "${SC_MODS[@]}"; do
+        case $m in shift) mask=$((mask | 1)) ;; ctrl) mask=$((mask | 4)) ;; alt) mask=$((mask | 8)) ;; meta) mask=$((mask | 64)) ;; esac
+    done
+    key="$(key_info "$SC_KEY")"; key="${key#* }"
+    json="$(hyprctl binds -j 2>/dev/null)" || { echo free; return; }
+    jq -r --argjson m "$mask" --arg k "${key,,}" --arg bin "$CLIP_BIN" '
+        [.[] | select(.modmask == $m and ((.key // "") | ascii_downcase) == $k)]
+        | if length == 0 then "free"
+          elif all(.[]; (.arg // "") | contains($bin)) then "ours"
+          else "taken" end' <<<"$json" 2>/dev/null || echo free
+}
+
+hyprland_bind() {  # hyprland_bind ACTION SHORTCUT
+    local b; b="$(bind_combo hypr "$2")"
+    case "$(hypr_owner "$2")" in
+        taken) warn "shortcut $2 is already bound in Hyprland, skipped ($1)"; return 1 ;;
+        ours) runq hyprctl keyword unbind "$b" || true ;;
+    esac
+    runq hyprctl keyword bind "$b, exec, $(quote "$CLIP_BIN") $1"
+}
+
+hyprland_unbind() {  # hyprland_unbind ACTION SHORTCUT
+    [[ -n "${2:-}" ]] || return 0
+    if [[ "$(hypr_owner "$2")" == taken ]]; then warn "Hyprland now binds $2 to something else; left alone"; return 0; fi
+    runq hyprctl keyword unbind "$(bind_combo hypr "$2")" || true
+}
+
+# Lower-case, sorted combo so Mod4+Mod1+v == mod1+mod4+V.
+sway_norm() {
+    local p parts out=()
+    IFS=+ read -ra parts <<<"${1,,}"
+    for p in "${parts[@]}"; do [[ "$p" == ctrl ]] && p=control; out+=("$p"); done
+    printf '%s\n' "${out[@]}" | sort | paste -sd+
+}
+
+# sway_taken SHORTCUT: is it bound in sway's config? Best effort: reads
+# `swaymsg -t get_config`, expands `set $var` lines, ignores --flags.
+sway_taken() {
+    local want cfg line combo w v
+    have swaymsg && have jq || return 1
+    want="$(sway_norm "$(bind_combo sway "$1")")"
+    cfg="$(swaymsg -t get_config -r 2>/dev/null | jq -r '.config, (.included_configs[]?.raw_contents // empty)' 2>/dev/null)" || return 1
+    local -A vars=()
+    while read -r line; do
+        if [[ "$line" =~ ^set[[:space:]]+(\$[A-Za-z0-9_]+)[[:space:]]+([^[:space:]]+) ]]; then
+            vars[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"; continue
+        fi
+        [[ "$line" =~ ^bindsym[[:space:]]+(.*)$ ]] || continue
+        read -ra w <<<"${BASH_REMATCH[1]}"
+        combo=""
+        for combo in "${w[@]}"; do [[ "$combo" == --* ]] || break; done
+        for v in "${!vars[@]}"; do combo="${combo//"$v"/"${vars[$v]}"}"; done
+        [[ "$(sway_norm "$combo")" == "$want" ]] && return 0
+    done <<<"$cfg"
+    return 1
+}
+
+sway_bind() {  # sway_bind ACTION SHORTCUT (one string, so paths may hold spaces)
+    if sway_taken "$2"; then warn "shortcut $2 is already bound in sway, skipped ($1)"; return 1; fi
+    runq swaymsg "bindsym $(bind_combo sway "$2") exec $(quote "$CLIP_BIN") $1"
+}
+
+sway_unbind() {
+    [[ -n "${2:-}" ]] || return 0
+    if sway_taken "$2"; then warn "sway's config binds $2; left alone"; return 0; fi
+    runq swaymsg "unbindsym $(bind_combo sway "$2")" || true
+}
+
+GS=org.gnome.settings-daemon.plugins.media-keys
+GP=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings
+
+# Current custom-keybinding paths, one per line. Fails unless gsettings
+# answers with a list, so we never write back a list we couldn't read.
+gnome_paths() {
+    local l
+    l="$(gsettings get $GS custom-keybindings 2>/dev/null)" || return 1
+    [[ "$l" =~ ^(@as\ )?\[.*\]$ ]] || return 1
+    l="${l#@as }"; l="${l#[}"; l="${l%]}"
+    tr ',' '\n' <<<"$l" | sed "s/^ *'//; s/' *$//" | grep -v '^$' || true
+}
+
+# gnome_apply "action shortcut"...: make clip's custom shortcuts exactly these.
+gnome_apply() {
+    local list p a key pair keep=() old=() mine=" "
+    list="$(gnome_paths)" || { warn "cannot read GNOME custom shortcuts; nothing changed"; return 1; }
+    while read -r p; do
+        [[ -n "$p" ]] || continue
+        if [[ "$p" == "$GP/clip-"* ]]; then old+=("$p"); else keep+=("$p"); fi
+    done <<<"$list"
+    for pair; do
+        a="${pair%% *}"; key="${pair#* }"; p="$GP/clip-$a/"
+        keep+=("$p"); mine+="$p "
+        run gsettings set "$GS.custom-keybinding:$p" name "$(gv_str "clip $a")"
+        run gsettings set "$GS.custom-keybinding:$p" command "$(gv_str "$(quote "$CLIP_BIN") $a")"
+        run gsettings set "$GS.custom-keybinding:$p" binding "$(gv_str "$(bind_combo gnome "$key")")"
+    done
+    local out=""
+    for p in "${keep[@]}"; do out+="${out:+, }'$p'"; done
+    run gsettings set $GS custom-keybindings "[$out]"
+    for p in "${old[@]}"; do
+        [[ "$mine" == *" $p "* ]] && continue
+        for key in name command binding; do run gsettings reset "$GS.custom-keybinding:$p" "$key"; done
+    done
+}
+
+unbind_saved() {  # unbind_saved BACKEND: remove what clip bound last time
+    local be="$1" a key saved
+    saved="$(state_get "$be")"
+    while read -r a key; do
+        if [[ -n "$a" ]]; then "${be}_unbind" "$a" "$key"; fi
+    done <<<"$saved"
+    if [[ "$be" == kde ]]; then  # .desktop shortcuts left without a state line
+        for a in "${ACTIONS[@]}"; do
+            if ! grep -q "^$a " <<<"$saved" && [[ -e "$(kde_desktop "$a")" ]]; then kde_unbind "$a"; fi
+        done
+    fi
+}
+
+cmd_bind() {
+    local be a key applied=()
+    be="$(bind_backend)"
+    case "$be" in
+        manual)
+            echo "clip: no shortcut support for this desktop; bind these yourself:"
+            for a in "${ACTIONS[@]}"; do
+                [[ -n "${CFG[bind.$a]}" ]] && echo "  ${CFG[bind.$a]}  ->  $(quote "$CLIP_BIN") $a"
+            done
+            return 0 ;;
+        gnome)
+            for a in "${ACTIONS[@]}"; do
+                key="${CFG[bind.$a]}"; [[ -n "$key" ]] && applied+=("$a $key")
+            done
+            gnome_apply "${applied[@]}" || return 1 ;;
+        *)
+            unbind_saved "$be"
+            for a in "${ACTIONS[@]}"; do
+                key="${CFG[bind.$a]}"; [[ -n "$key" ]] || continue
+                if "${be}_bind" "$a" "$key"; then applied+=("$a $key"); fi
+            done ;;
+    esac
+    state_save "$be" "${applied[@]}"
+}
+
+cmd_unbind() {
+    local be; be="$(bind_backend)"
+    case "$be" in
+        manual) echo "clip: remove your manual shortcuts for clip"; return 0 ;;
+        gnome) gnome_apply || return 1 ;;
+        *) unbind_saved "$be" ;;
+    esac
+    state_save "$be"
+}
+
+# ----------------------------------------------------------------- service
+
+unit_file() { echo "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/clip.service"; }
+
+cmd_service() {
+    local u; u="$(unit_file)"
+    case "${1:-}" in
+        on)
+            if dry; then echo "+ write $u (ExecStart=$(systemd_arg "$CLIP_BIN") daemon)"
+            else
+                mkdir -p "$(dirname "$u")"
+                cat >"$u" <<EOF
+[Unit]
+Description=clip screenshot shortcuts and replay buffer
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=$(systemd_arg "$CLIP_BIN") daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+            fi
+            # The daemon needs the session's display variables.
+            local v vars=()
+            for v in WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK; do
+                [[ -n "${!v:-}" ]] && vars+=("$v")
+            done
+            ((${#vars[@]})) && run systemctl --user import-environment "${vars[@]}"
+            run systemctl --user daemon-reload
+            run systemctl --user enable --now clip.service ;;
+        off)
+            run systemctl --user disable --now clip.service || true
+            run rm -f "$u"
+            run systemctl --user daemon-reload ;;
+        *) die "usage: clip service on|off" 2 ;;
+    esac
+}
+
+cmd_status() {
+    local f pid
+    echo "config: $CONFIG$([[ -f $CONFIG ]] || echo ' (defaults; run clip config)')"
+    echo "images: $(images_dir)"
+    echo "videos: $(videos_dir)"
+    if pid="$(live_pid "$RUNDIR/daemon.pid")"; then echo "daemon: running (pid $pid)"; else echo "daemon: stopped"; fi
+    if live_pid "$RUNDIR/replay.pid" >/dev/null; then echo "replay: running, $(sed -n 2p "$RUNDIR/replay.pid")s buffer"; else echo "replay: off"; fi
+    if live_pid "$RUNDIR/record.pid" >/dev/null; then f="$(sed -n 2p "$RUNDIR/record.pid")"; echo "record: recording to $f"; else echo "record: idle"; fi
+    if have systemctl; then
+        echo "service: $(systemctl --user is-enabled clip.service 2>/dev/null || true)/$(systemctl --user is-active clip.service 2>/dev/null || true)"
+    fi
+}
+
+# -------------------------------------------------------------------- main
+
+main() {
+    local cmd="${1:-}"
+    case "$cmd" in
+        -h|--help|help) usage; return 0 ;;
+        -v|--version) echo "clip $VERSION"; return 0 ;;
+        "") usage >&2; return 2 ;;
+    esac
+    load_config
+    case "$cmd" in
+        --detect) cmd_detect ;;
+        region|window|monitor|all) cmd_shot "$cmd" ;;
+        replay) cmd_replay ;;
+        record) cmd_record ;;
+        daemon) cmd_daemon ;;
+        bind) cmd_bind ;;
+        unbind) cmd_unbind ;;
+        service) cmd_service "${2:-}" ;;
+        status) cmd_status ;;
+        config) cmd_config ;;
+        _saved) cmd_saved "${2:?}" "${3:-regular}" ;;
+        _toast) toast "${2:?}" "${3:?}" "${4:-0}" ;;
+        *) echo "clip: unknown command: $cmd" >&2; usage >&2; return 2 ;;
+    esac
+}
+
+# Sourcing (tests) defines the functions without running anything.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
