@@ -41,3 +41,9 @@ and copy to the clipboard on every major Linux desktop, KDE first.
 - `bash tests/smoke.sh` → 7 × ok, exit 0.
 - `bin/clip --detect` → session=wayland, desktop=kde, capture=spectacle,
   clipboard=wl-copy, save_dir=/home/kevin/Pictures.
+
+## Team memory
+
+<!-- workspace:memory:start -->
+- clip layout (2026-10-17): /home/kevin/Workspace/clip, local git (main, b564813). bin/clip = single Bash script (skeleton: --help/--version/--detect; capture not built), tests/smoke.sh (7 checks, no real screenshots), README/AGENTS/CLAUDE(@AGENTS.md)/HANDOFF. Checks: bash -n bin/clip; bash tests/smoke.sh. grim fails on KDE Wayland, so KDE uses spectacle -b -n. Licence undecided (GPL-3.0 if Hyprshot code reused) - ask Kevin. (Sora, 2026-10-17)
+<!-- workspace:memory:end -->
