@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# clip - quick screenshots to a file and the clipboard on any Linux desktop.
+# Inspired by Hyprshot (https://github.com/Gustash/hyprshot).
+# Status: skeleton. Backend detection works; capture is not implemented yet.
+set -euo pipefail
+
+VERSION="0.0.1"
+
+usage() {
+    cat <<'EOF'
+Usage: clip [options]
+
+Options:
+  -m, --mode MODE      region | window | output (not implemented yet)
+  --clipboard-only     copy to clipboard, do not save a file
+  --detect             print the detected session, desktop and backends
+  -v, --version        print version
+  -h, --help           show this help
+
+Environment:
+  CLIP_DIR             save folder (default: XDG Pictures dir or ~/Pictures)
+EOF
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+session_type() { echo "${XDG_SESSION_TYPE:-unknown}"; }
+
+desktop() {
+    if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then echo hyprland; return; fi
+    local d="${XDG_CURRENT_DESKTOP:-unknown}"
+    echo "${d,,}"
+}
+
+# Capture backend. grim only works on wlroots-style compositors (Hyprland,
+# Sway); KWin and Mutter reject it, so KDE uses Spectacle.
+capture_backend() {
+    local s d
+    s="$(session_type)"; d="$(desktop)"
+    case "$d" in
+        hyprland|sway|river|wlroots)
+            have grim && { echo grim; return; } ;;
+        *kde*)
+            have spectacle && { echo spectacle; return; } ;;
+        *gnome*)
+            have gnome-screenshot && { echo gnome-screenshot; return; } ;;
+    esac
+    if [[ "$s" == x11 ]]; then
+        have maim && { echo maim; return; }
+        have import && { echo import; return; }
+    fi
+    echo none
+}
+
+clipboard_backend() {
+    if [[ "$(session_type)" == wayland ]] && have wl-copy; then echo wl-copy; return; fi
+    have xclip && { echo xclip; return; }
+    have xsel && { echo xsel; return; }
+    echo none
+}
+
+save_dir() {
+    if [[ -n "${CLIP_DIR:-}" ]]; then echo "$CLIP_DIR"; return; fi
+    if have xdg-user-dir; then xdg-user-dir PICTURES; return; fi
+    echo "$HOME/Pictures"
+}
+
+detect() {
+    echo "session=$(session_type)"
+    echo "desktop=$(desktop)"
+    echo "capture=$(capture_backend)"
+    echo "clipboard=$(clipboard_backend)"
+    echo "save_dir=$(save_dir)"
+}
+
+main() {
+    local mode="" clipboard_only=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) usage; return 0 ;;
+            -v|--version) echo "clip $VERSION"; return 0 ;;
+            --detect) detect; return 0 ;;
+            -m|--mode) mode="${2:-}"; shift ;;
+            --clipboard-only) clipboard_only=1 ;;
+            *) echo "clip: unknown option: $1" >&2; usage >&2; return 2 ;;
+        esac
+        shift
+    done
+    if [[ -z "$mode" ]]; then usage >&2; return 2; fi
+    case "$mode" in
+        region|window|output) ;;
+        *) echo "clip: unknown mode: $mode" >&2; return 2 ;;
+    esac
+    : "$clipboard_only"
+    echo "clip: capture is not implemented yet (mode=$mode)" >&2
+    return 1
+}
+
+main "$@"
