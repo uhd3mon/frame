@@ -11,6 +11,19 @@ on KDE, GNOME, Hyprland, Sway and X11. MIT, all our own code (no
 Hyprshot code). Sections below this one are history and use the old
 names (clip, clipped).
 
+## Published on GitHub (2026-10-18)
+
+- Public repo https://github.com/KevinEightSeven/frame (MIT), branch
+  `main`, remote `origin`. Pushing is OK for this project.
+- Kevin's rule: no Claude contributors or commit references. History was
+  rewritten before the first push to drop every `Co-Authored-By: Claude`
+  trailer (all commits were affected; hashes changed, e.g. 9fc9a92 ->
+  ba1c9d9). Never add AI co-author trailers to commits or PRs here.
+- CLAUDE.md is gitignored and removed from history; it stays locally
+  (content `@AGENTS.md`) for Workspace. Pre-rewrite backup bundle was
+  in the scratch tmp/ only.
+- Checks before push: bash -n, smoke and cargo test (see commit).
+
 ## Frame 0.3.0: Sora's check + real install (2026-10-17 ~23:58)
 
 Kevin asked: modern GUI, start at login with all settings, replay

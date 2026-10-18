@@ -69,7 +69,7 @@ install.sh       install / --uninstall under PREFIX (+ DESTDIR)
 tests/smoke.sh   smoke tests, dry-run only
 README.md        user overview
 LICENSE          MIT
-AGENTS.md        rules for agents (CLAUDE.md points here)
+AGENTS.md        rules for contributors and agents
 HANDOFF.md       current state and history
 ```
 

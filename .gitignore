@@ -8,3 +8,4 @@
 *.local
 !gui/icons/png/*.png
 gui/target/
+CLAUDE.md
