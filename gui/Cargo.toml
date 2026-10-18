@@ -1,0 +1,25 @@
+[package]
+name = "clip-gui"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Tray icon and settings window for clip"
+publish = false
+
+[[bin]]
+name = "clip-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "=0.33.3", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+ksni = { version = "=0.3.6", default-features = false, features = ["tokio", "blocking"] }
+png = "0.18"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

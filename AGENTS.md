@@ -11,20 +11,34 @@ lessons, checks you actually ran and what they printed).
 A background screenshot / replay / recording tool driven by global
 shortcuts (region, window, monitor, all, replay, record). Saves to
 `<save_dir>/clip/images` and `/videos`, copies to the clipboard, works on
-KDE, GNOME, Hyprland, Sway and X11. No UI; one config file.
+KDE, GNOME, Hyprland, Sway and X11. One config file. `bin/clip` is the
+engine; `clip-gui` (Rust, `gui/`) is an optional tray icon + settings
+window on top of it.
 
 ## Constraints
 
 - MIT licence. All code is our own: do not copy code from Hyprshot or
   other projects.
-- Plain Bash, one script (`bin/clip`). Call existing tools; do not ship a
-  compiled binary unless the team agrees one is needed.
+- Plain Bash, one script (`bin/clip`). Call existing tools. The only
+  compiled part is `gui/` (Kevin asked for it, 2026-10-17): eframe/egui
+  (glow) window, ksni tray, png, rfd. The GUI never does clip's work: it
+  runs `clip …`, reads clip's pid files and edits the config. Keep its
+  deps lean; don't add a second binary.
+- The GUI's config reader must follow bash `load_config` exactly, and
+  its writer must only change edited values (comments, order, unknown
+  keys kept). Every write goes through `clip check` on a temp file
+  before the rename. Keys/defaults in `gui/src/config.rs` must match
+  `default_config()` (a test checks this).
 - One config file, parsed as `key = value` text. Never `source` or eval it.
 - Pick backends at runtime by desktop/session; never assume Hyprland.
 - grim does **not** work on KWin or Mutter. KDE uses `spectacle -b -n`;
   GNOME uses gnome-screenshot. Video uses gpu-screen-recorder.
 - Tests must not take real screenshots or recordings, touch the
-  clipboard, send notifications or change real shortcuts. Use
+  clipboard, send notifications, change real shortcuts or install into
+  the real `~/.local` (use `DESTDIR`, or a temp `PREFIX` with a fake
+  `bin/clip`: a real-mode `--uninstall` runs `clip service off/unbind`).
+  GUI tests hold `testutil::env_lock()` and call `test_env` (dry run,
+  temp XDG dirs, no shortcut backend). Use
   `CLIP_DRY_RUN=1`, a temp `CLIP_CONFIG`, temp XDG dirs (incl.
   `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `TMPDIR`) and the fakes in
   `tests/smoke.sh` for real-mode runs.
@@ -35,6 +49,9 @@ KDE, GNOME, Hyprland, Sway and X11. No UI; one config file.
 
 ```
 bin/clip         the tool (executable Bash)
+gui/             clip-gui crate: src/{main,tray,settings,config,state,icons}.rs
+gui/icons/       app + tray icons (SVG sources, png/ rendered by render.sh)
+install.sh       install / --uninstall under PREFIX (+ DESTDIR)
 tests/smoke.sh   smoke tests, dry-run only
 README.md        user overview
 LICENSE          MIT
@@ -46,9 +63,23 @@ HANDOFF.md       current state and history
 
 ```sh
 bash -n bin/clip       # syntax check
-bash tests/smoke.sh    # 84 checks, exits 0 on pass (~10 s)
+bash tests/smoke.sh    # 95 checks, "95 checks, all passed" (~14 s
+                       # once gui/ is built; cargo test is one check)
 bin/clip --detect      # shows chosen backends and resolved settings
+cd gui && cargo test   # 29 tests, "test result: ok. 29 passed"
+cd gui && cargo clippy # no warnings
+cd gui && cargo build --release   # ~35 s clean; 6.6 MB stripped binary
+DESTDIR=/tmp/x ./install.sh --no-build   # 12 files + manifest; then --uninstall
 ```
+
+GUI checks without touching the real session state: set temp
+`XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `CLIP_CONFIG`
+and `CLIP_BIN=bin/clip`; keep `DBUS_SESSION_BUS_ADDRESS` and use an
+absolute `WAYLAND_DISPLAY=/run/user/$UID/wayland-0` so the window still
+opens. `CLIP_GUI_SHOT=file.png clip-gui --settings` saves the window's
+own frame and quits (no desktop screenshot). Tray state can be read with
+`busctl --user get-property <item> /StatusNotifierItem
+org.kde.StatusNotifierItem ToolTip`.
 
 Functions can be unit-tested by sourcing the script
 (`source bin/clip; qt_keyint Meta+Alt+F12`); `main` only runs when it is

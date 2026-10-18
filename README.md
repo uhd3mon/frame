@@ -1,7 +1,8 @@
 # clip
 
 Screenshots, instant-replay clips and recordings for Linux, driven by
-global shortcuts. No UI: a small background daemon and one config file.
+global shortcuts: a small background daemon and one config file, plus an
+optional tray icon and settings window (`clip-gui`).
 Works on KDE Plasma, GNOME, Hyprland, Sway and X11.
 
 ## Quick start
@@ -13,6 +14,56 @@ bin/clip service on    # start the daemon now and at every login
 
 The daemon sets the shortcuts below and keeps a replay buffer running.
 Run `clip service off` to stop it and `clip unbind` to drop the shortcuts.
+
+## Install
+
+```sh
+./install.sh             # builds clip-gui (needs cargo), installs to ~/.local
+./install.sh --uninstall
+```
+
+It installs `bin/clip` and `clip-gui` to `$PREFIX/bin` (default
+`~/.local`), the `clip` icon to `share/icons/hicolor` and a **Clip**
+start-menu entry (`share/applications/clip.desktop`, runs
+`clip-gui --open`). `PREFIX=/usr/local` and `DESTDIR=/tmp/pkg` work as
+usual; `--no-build` installs an existing `gui/target/release/clip-gui`.
+The list of installed files goes to `share/clip/installed`. Install
+refuses to replace a `bin/clip` or `bin/clip-gui` it didn't put there
+(`--force` does). `--uninstall` removes only the listed files; for a
+real install (no `DESTDIR`) it first stops the tray, runs
+`clip service off` and `clip unbind`, and removes the "Start tray at
+login" entry if it starts this clip-gui.
+
+## Tray and settings (clip-gui)
+
+`clip-gui` is a tray icon that shows what clip is doing: grey = idle,
+teal = replay buffer running, red = recording. The tooltip says the
+same (“clip: recording to …”, “clip: replay buffer 60 s”, “clip: not
+running”). Its menu: Start/Stop recording, Save replay, Screenshot
+(region / window / monitor / all), Open clip folder, Background service
+(`clip service on|off`), Settings…, Quit. Clicking the icon opens the
+settings.
+
+The settings window edits the config file: save folder and formats,
+video and replay options, the six shortcuts (type them, or press
+**Record** and then the keys; egui can't see the Meta key on Linux, so
+an *add Meta* box adds it) and **Start tray at login** (writes
+`~/.config/autostart/clip-gui.desktop`). Save keeps your comments and
+line order and only changes the values you edited. It checks the new
+file with `clip check` first; if clip rejects it, the real file is left
+alone and the error is shown. Changed shortcuts are re-applied right
+away when the daemon runs (or clip has bound them before); changed video
+settings offer **Restart service**.
+
+| Command | What it does |
+|---|---|
+| `clip-gui` | tray (only one runs; a second start opens settings) |
+| `clip-gui --open` | tray if not running, and the settings window |
+| `clip-gui --settings` | only the settings window (one at a time) |
+
+The tray needs a StatusNotifierItem host (KDE, most panels; GNOME needs
+the AppIndicator extension). clip-gui finds clip via `$CLIP_BIN`, then
+`clip` next to itself, then the repo's `bin/clip`, then `PATH`.
 
 ## Commands
 
@@ -29,6 +80,7 @@ Run `clip service off` to stop it and `clip unbind` to drop the shortcuts.
 | `clip service on\|off` | systemd user unit `clip.service` |
 | `clip status` | daemon, replay, recording, service |
 | `clip config` | create the config if missing, print path |
+| `clip check` | validate the config: `ok`, or the error and exit 2 |
 | `clip --detect` | show the backends clip would use |
 
 Each capture is saved, copied to the clipboard (images as image data,
@@ -115,7 +167,10 @@ bash tests/smoke.sh
 
 Uses `CLIP_DRY_RUN=1`, a temp config and temp XDG dirs, with fake
 recorder / gsettings / notify-send first on `PATH`: no screenshots,
-recordings, clipboard, notifications or shortcut changes.
+recordings, clipboard, notifications or shortcut changes. If cargo is
+installed it also runs the GUI's unit tests (`cargo test` in `gui/`),
+and if a release build exists it installs into a temp `DESTDIR` and a
+temp `PREFIX` (with a stand-in clip and tray) and uninstalls again.
 
 ## Licence
 

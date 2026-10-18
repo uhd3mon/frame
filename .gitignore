@@ -6,3 +6,5 @@
 *.mkv
 .env
 *.local
+!gui/icons/png/*.png
+gui/target/

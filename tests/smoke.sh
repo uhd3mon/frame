@@ -79,7 +79,7 @@ realconf() { conf 'clipboard = false' 'notify = false' 'video_source = DP-9' 'vi
 
 check "syntax"            "bash -n '$CLIP'"
 check "help"              "'$CLIP' --help | grep -q '^Usage: clip'"
-check "version 0.1.0"     "[ \"\$('$CLIP' --version)\" = 'clip 0.1.0' ]"
+check "version 0.2.0"     "[ \"\$('$CLIP' --version)\" = 'clip 0.2.0' ]"
 check "unknown command=2" "'$CLIP' nope; [ \$? -eq 2 ]"
 check "config writes default" "'$CLIP' config | grep -qx '$CLIP_CONFIG' && grep -q '^bind.record = Meta+Alt+V' '$CLIP_CONFIG' && grep -q '^save_dir = ~/Documents' '$CLIP_CONFIG' && grep -qF '\$VARS are not'  '$CLIP_CONFIG'"
 check "default config parses" "'$CLIP' --detect | grep -qx 'images=$HOME/Documents/clip/images'"
@@ -99,6 +99,22 @@ for bad in 'image_format = gif' 'save_dir = docs' 'save_dir = ~kevin/x' 'save_di
     [[ "$bad" == save_dir* ]] && printf '%s\n' "$bad" >"$CLIP_CONFIG"
     check "rejects: ${bad//$'\n'/; }" "'$CLIP' --detect; [ \$? -eq 2 ]"
 done
+conf 'image_format = webp   # c' 'video_fps = 30'
+check "check: good config" "out=\$('$CLIP' check 2>&1) && [ \"\$out\" = ok ]"
+conf 'video_fps = fast'
+check "check: bad config exits 2" "out=\$('$CLIP' check 2>&1); [ \$? -eq 2 ] && grep -qx 'clip: video_fps must be 1-240' <<<\"\$out\" && ! grep -qx ok <<<\"\$out\""
+t_u3000() {   # U+3000 before # is no space for bash either (load_config runs under LC_ALL=C)
+    printf 'save_dir = %s\naudio = x\343\200\200#c\nbind.all = Meta+\342\204\252\n' "$T/docs" >"$T/u3000"
+    local out; out=$(CLIP_CONFIG="$T/u3000" LC_ALL=en_US.UTF-8 bash -c 'source "$CLIP"; load_config; printf %s "${CFG[audio]}"' 2>&1)
+    [ $? -eq 2 ] && grep -q "bind.all: 'Meta+.*' is not a shortcut" <<<"$out" || { echo "$out"; return 1; }   # Kelvin sign is not k
+    sed -i '$d' "$T/u3000"
+    out=$(CLIP_CONFIG="$T/u3000" LC_ALL=en_US.UTF-8 bash -c 'source "$CLIP"; load_config; printf %s "${CFG[audio]}"') || return 1
+    [ "$out" = "$(printf 'x\343\200\200#c')" ] || { echo "got [$out]"; return 1; }
+    [ "${LC_ALL:-unset}" = "$(CLIP_CONFIG="$T/u3000" bash -c 'source "$CLIP"; load_config >/dev/null 2>&1; echo "${LC_ALL:-unset}"')" ]   # local, not leaked
+}
+export -f t_u3000
+check "config: U+3000 isn't space, Kelvin isn't k" t_u3000
+check "check: missing config = defaults" "[ \"\$(CLIP_CONFIG='$T/none' '$CLIP' check)\" = ok ] && [ ! -e '$T/none' ]"
 printf '%s\n' 'save_dir = ~/x' >"$CLIP_CONFIG"
 check "save_dir ~/ expands" "'$CLIP' --detect | grep -qx 'images=$HOME/x/clip/images'"
 
@@ -258,7 +274,83 @@ fi
 
 check "saved hook names replay" "'$CLIP' _saved /x/Replay_1.mp4 replay | grep -Eq '^\+ mv /x/Replay_1.mp4 $T/docs/clip/videos/.*_replay.mp4\$'"
 check "video clipboard uri" "'$CLIP' _saved '/x/a b.mp4' regular | grep -qF 'wl-copy --type text/uri-list file:///x/a%20b.mp4'"
+t_bind_lock() {   # a second bind/unbind waits for bind.lock, then gives up
+    local out
+    mkdir -p "$T/run/clip"
+    exec 7>"$T/run/clip/bind.lock"; flock 7
+    out=$(CLIP_BIND_WAIT=1 "$CLIP" bind 2>&1 7>&-); [ $? -eq 1 ] || { echo "$out"; return 1; }
+    grep -q 'another clip bind/unbind is still running' <<<"$out" || { echo "$out"; return 1; }
+    out=$(CLIP_BIND_WAIT=1 "$CLIP" unbind 2>&1 7>&-); [ $? -eq 1 ] || return 1
+    exec 7>&-
+    "$CLIP" bind >/dev/null
+}
+export -f t_bind_lock
+check "bind.lock: second bind waits, fails" t_bind_lock
+check "bind.lock released after bind" "$(lib "with_bind_lock true && flock -n '$T/run/clip/bind.lock' true")"
 check "status runs"       "'$CLIP' status | grep -q '^daemon: stopped'"
+# ---- GUI (gui/, Rust): only where cargo / a release build exist
+ROOT="$(dirname "$(dirname "$CLIP")")"; export ROOT
+if command -v cargo >/dev/null; then
+    check "gui: cargo test" "cargo test --quiet --manifest-path '$ROOT/gui/Cargo.toml'"
+fi
+t_install() {   # into a temp DESTDIR; uninstall removes exactly the manifest
+    local d="$T/dest" n out
+    DESTDIR="$d" PREFIX=/usr/local "$ROOT/install.sh" --no-build >/dev/null || return 1
+    n=$(find "$d" -type f | wc -l); [ "$n" = 13 ] || { echo "installed $n files"; return 1; }
+    [ "$(wc -l <"$d/usr/local/share/clip/installed")" = 12 ] || return 1
+    grep -qx 'Exec=/usr/local/bin/clip-gui --open' "$d/usr/local/share/applications/clip.desktop" || return 1
+    grep -qx 'Categories=Utility;' "$d/usr/local/share/applications/clip.desktop" || return 1
+    if command -v desktop-file-validate >/dev/null; then
+        out=$(desktop-file-validate "$d/usr/local/share/applications/clip.desktop") && [ -z "$out" ] || { echo "$out"; return 1; }
+    fi
+    echo keep >"$d/usr/outside"; echo ../outside >>"$d/usr/local/share/clip/installed"
+    out=$(DESTDIR="$d" PREFIX=/usr/local "$ROOT/install.sh" --uninstall 2>&1) || return 1
+    grep -q 'skipped odd manifest line: ../outside' <<<"$out" || { echo "$out"; return 1; }
+    [ "$(find "$d" -type f)" = "$d/usr/outside" ]
+}
+# No DESTDIR, temp PREFIX (with a space): uninstall stops our tray (a
+# copy of sleep named clip-gui), runs clip service off + unbind (bin/clip
+# swapped for a logger) and removes the autostart entry only if it is ours.
+t_install_live() {
+    local p="$T/live $1" auto="$XDG_CONFIG_HOME/autostart/clip-gui.desktop" out pid i
+    rm -f "$T/uninst.log" "$auto"
+    PREFIX="$p" "$ROOT/install.sh" --no-build >/dev/null || return 1
+    printf '#!/bin/sh\necho "$*" >>"%s/uninst.log"\n' "$T" >"$p/bin/clip"
+    cp /usr/bin/sleep "$p/bin/clip-gui"
+    ( "$p/bin/clip-gui" 60 </dev/null >/dev/null 2>&1 & echo $! >"$T/fgui.pid" )
+    pid=$(cat "$T/fgui.pid")
+    mkdir -p "${auto%/*}"
+    if [ "$1" = ours ]; then printf '[Desktop Entry]\nExec="%s"\n' "$p/bin/clip-gui" >"$auto"
+    else printf '[Desktop Entry]\nExec=/opt/other/clip-gui\n' >"$auto"; fi
+    out=$(PREFIX="$p" "$ROOT/install.sh" --uninstall 2>&1) || { echo "$out"; return 1; }
+    for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    kill -0 "$pid" 2>/dev/null && { kill "$pid"; echo "tray not stopped"; return 1; }
+    grep -q "stopping clip-gui (pid $pid)" <<<"$out" || { echo "$out"; return 1; }
+    [ "$(cat "$T/uninst.log")" = "$(printf 'service off\nunbind')" ] || return 1
+    if [ "$1" = ours ]; then [ ! -e "$auto" ] || return 1
+    else [ -e "$auto" ] && grep -q "note: kept $auto" <<<"$out" || return 1; fi
+    out=$(find "$p" -type f ! -name mimeinfo.cache ! -name icon-theme.cache); [ -z "$out" ] || { echo "$out"; return 1; }
+}
+t_install_foreign() {   # a bin/clip we didn't install is not replaced or removed
+    local p="$T/fpfx" out
+    mkdir -p "$p/bin"; printf '#!/bin/sh\n# not ours\n' >"$p/bin/clip"
+    out=$(PREFIX="$p" "$ROOT/install.sh" --no-build 2>&1); [ $? -ne 0 ] || return 1
+    grep -q "$p/bin/clip exists and was not installed by this script" <<<"$out" || { echo "$out"; return 1; }
+    grep -q 'not ours' "$p/bin/clip" && [ ! -e "$p/bin/clip-gui" ] || return 1
+    out=$(PREFIX="$p" "$ROOT/install.sh" --uninstall 2>&1); [ $? -ne 0 ] && grep -q 'nothing removed' <<<"$out" || return 1
+    grep -q 'not ours' "$p/bin/clip" || return 1
+    DESTDIR="$T/fdest" PREFIX="$p" "$ROOT/install.sh" --no-build >/dev/null || return 1   # DESTDIR is checked, not PREFIX
+    PREFIX="$p" "$ROOT/install.sh" --no-build --force >/dev/null && ! grep -q 'not ours' "$p/bin/clip" \
+        && grep -qx bin/clip "$p/share/clip/installed"
+}
+export -f t_install t_install_live t_install_foreign
+if [ -x "$ROOT/gui/target/release/clip-gui" ]; then
+    check "install.sh into DESTDIR + uninstall" t_install
+    check "uninstall (live): tray, service, unbind, our autostart" "t_install_live ours"
+    check "uninstall (live): keeps someone else's autostart" "t_install_live other"
+    check "install refuses a foreign bin/clip" t_install_foreign
+fi
+
 check "no real notify/clipboard calls" "[ ! -e '$T/real-calls.log' ] || { cat '$T/real-calls.log'; false; }"
 
 echo "$n checks, $([ $fail = 0 ] && echo all passed || echo FAILURES)"

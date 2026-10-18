@@ -3,7 +3,7 @@
 # Runs in the background with global shortcuts; no UI. MIT licence.
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 CLIP_BIN="$(readlink -f "${BASH_SOURCE[0]}")"
 ACTIONS=(region window monitor all replay record)
 RUNDIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/clip-$UID}/clip"
@@ -35,6 +35,7 @@ Background:   daemon       apply shortcuts and run the replay buffer
               bind|unbind  add / remove the global shortcuts
               service on|off   run the daemon as a systemd user service
 Other:        status | config | --detect | --help | --version
+              check        validate the config: prints ok, or exits 2
 
 Config: ${XDG_CONFIG_HOME:-~/.config}/clip/config (env CLIP_CONFIG overrides).
 CLIP_DRY_RUN=1 prints capture, record, clipboard, notification and bind
@@ -114,8 +115,10 @@ EOF
 }
 
 # Parse key = value lines. The file is never sourced or evaluated.
+# LC_ALL=C: [[:space:]] and ${x,,} are ASCII only, whatever the locale
+# (clip-gui's parser follows the same rule).
 load_config() {
-    local line key val n=0
+    local LC_ALL=C line key val n=0
     if [[ -f "$CONFIG" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
             n=$((n + 1))
@@ -670,6 +673,7 @@ key_info() {
 # SC_KEY. Fails unless every part is a modifier or a known key, with
 # exactly one key. This is also what keeps config text out of commands.
 parse_shortcut() {
+    local LC_ALL=C
     local s="${1//[[:space:]]/}" part parts
     SC_MODS=(); SC_KEY=""
     [[ -n "$s" && "$s" != *+ ]] || return 1   # read drops a trailing empty part
@@ -908,7 +912,26 @@ unbind_saved() {  # unbind_saved BACKEND: remove what clip bound last time
     fi
 }
 
-cmd_bind() {
+# One bind/unbind at a time: the daemon binds when it starts, and
+# clip-gui rebinds on Save. The lock fd is closed before returning, so a
+# daemon doesn't hold it (or hand it to gsr) for its whole life.
+with_bind_lock() {
+    local fd rc=0
+    ensure_rundir
+    exec {fd}>"$RUNDIR/bind.lock"
+    if ! flock -w "${CLIP_BIND_WAIT:-30}" "$fd"; then
+        exec {fd}>&-
+        warn "another clip bind/unbind is still running"; return 1
+    fi
+    "$@" || rc=$?
+    exec {fd}>&-
+    return "$rc"
+}
+
+cmd_bind() { with_bind_lock bind_now; }
+cmd_unbind() { with_bind_lock unbind_now; }
+
+bind_now() {
     local be a key applied=()
     be="$(bind_backend)"
     case "$be" in
@@ -933,7 +956,7 @@ cmd_bind() {
     state_save "$be" "${applied[@]}"
 }
 
-cmd_unbind() {
+unbind_now() {
     local be; be="$(bind_backend)"
     case "$be" in
         manual) echo "clip: remove your manual shortcuts for clip"; return 0 ;;
@@ -1019,6 +1042,7 @@ main() {
         service) cmd_service "${2:-}" ;;
         status) cmd_status ;;
         config) cmd_config ;;
+        check) echo ok ;;   # load_config above already validated it
         _saved) cmd_saved "${2:?}" "${3:-regular}" ;;
         _toast) toast "${2:?}" "${3:?}" "${4:-0}" ;;
         *) echo "clip: unknown command: $cmd" >&2; usage >&2; return 2 ;;
