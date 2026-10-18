@@ -81,6 +81,7 @@ the AppIndicator extension). clipped-gui finds clipped via `$CLIPPED_BIN`, then
 | `clipped status` | daemon, replay, recording, service |
 | `clipped config` | create the config if missing, print path |
 | `clipped check` | validate the config: `ok`, or the error and exit 2 |
+| `clipped monitors` | monitors you can record, `NAME\|WxH`, the one you're on marked `\|active` |
 | `clipped --detect` | show the backends clipped would use |
 
 Each capture is saved, copied to the clipboard (images as image data,
@@ -109,7 +110,7 @@ parsed, never executed; bad values stop clipped with exit code 2.
 | `notify` | `true` | notify-send toast with preview |
 | `replay` | `true` | replay buffer in the daemon |
 | `replay_seconds` | `auto` | 5–1800; auto = 60 with ≥ 8 GiB free RAM, else 30 |
-| `video_source` | `auto` | focused/first monitor, or `DP-1`, `portal`… |
+| `video_source` | `auto` | monitor you're on (KDE, Hyprland, Sway; else the first), or `DP-1`, `portal`, `screen` (X11). A recording picks it when it starts; the replay buffer when the daemon starts |
 | `video_fps` | `60` | 1–240 |
 | `video_quality` | `very_high` | `medium`, `high`, `very_high`, `ultra` |
 | `video_codec` | `auto` | best the GPU encodes: av1 > hevc > h264 (webm: av1, vp9, vp8) |
@@ -131,11 +132,20 @@ Files are named `YYYY-MM-DD_HH-MM-SS_<action>.<ext>`.
 
 | Desktop | Screenshots | Shortcuts |
 |---|---|---|
-| KDE Plasma | spectacle | KGlobalAccel (via .desktop files) |
+| KDE Plasma (Wayland) | KWin itself via `clipped-gui --grab` (+ slurp for region) | KGlobalAccel (via .desktop files) |
+| KDE Plasma (X11), or no clipped-gui | spectacle | KGlobalAccel |
 | Hyprland | grim + slurp + hyprctl | `hyprctl keyword bind` |
 | Sway | grim + slurp + swaymsg | `swaymsg bindsym` |
 | GNOME | gnome-screenshot (`monitor` = `all`) | gsettings custom keybindings |
 | X11 (other) | maim + slop + xdotool, or import | printed for you to add |
+
+On KDE Wayland no Spectacle is needed: `clipped-gui --grab
+all|monitor|window|area X Y W H OUT.png` asks KWin's built-in
+ScreenShot2 D-Bus API for the pixels. KWin only answers a program named
+by a `.desktop` file with `X-KDE-DBUS-Restricted-Interfaces`, so this
+works once `./install.sh` has written `clipped.desktop` (its `Exec=` is
+the absolute path of the installed clipped-gui). clipped looks for
+clipped-gui in `$CLIPPED_GUI`, next to itself, then on `PATH`.
 
 Clipboard: wl-copy on Wayland, xclip on X11. Video: gpu-screen-recorder
 (replay buffer in RAM, saved with SIGUSR1). Without it, `clipped record`

@@ -36,6 +36,7 @@ Background:   daemon       apply shortcuts and run the replay buffer
               service on|off   run the daemon as a systemd user service
 Other:        status | config | --detect | --help | --version
               check        validate the config: prints ok, or exits 2
+              monitors     monitors you can record: NAME|WxH[|active]
 
 Config: ${XDG_CONFIG_HOME:-~/.config}/clipped/config (env CLIPPED_CONFIG overrides).
 CLIPPED_DRY_RUN=1 prints capture, record, clipboard, notification and bind
@@ -97,7 +98,8 @@ notify = true              # notification with a preview (notify-send)
 
 replay = true              # keep a replay buffer running in the daemon
 replay_seconds = auto      # 5-1800; auto = 60 with >= 8 GiB free RAM, else 30
-video_source = auto        # auto = focused/first monitor, or DP-1, portal, screen...
+video_source = auto        # auto = monitor you're on; or DP-1, portal, screen (X11)
+                           # (clipped monitors lists them; replay picks at daemon start)
 video_fps = 60             # 1-240
 video_quality = very_high  # medium | high | very_high | ultra
 video_codec = auto         # auto = best the GPU encodes (av1 > hevc > h264)
@@ -202,11 +204,23 @@ desktop() {
     else echo "${d:-unknown}"; fi
 }
 
-# grim only works on wlroots compositors; KWin and Mutter reject it.
+# clipped-gui: $CLIPPED_GUI if set (only that), else next to this script,
+# else on PATH. Prints nothing if there is none.
+gui_bin() {
+    local g
+    if [[ -n "${CLIPPED_GUI:-}" ]]; then [[ -x "$CLIPPED_GUI" ]] && echo "$CLIPPED_GUI"; return 0; fi
+    g="${CLIPPED_BIN%/*}/clipped-gui"
+    if [[ -x "$g" ]]; then echo "$g"; else command -v clipped-gui || true; fi
+}
+
+# grim only works on wlroots compositors; KWin and Mutter reject it. On KDE
+# Wayland clipped-gui asks KWin itself (ScreenShot2), so Spectacle is only a
+# fallback.
 capture_backend() {
     case "$(desktop)" in
         hyprland|sway) have grim && { echo grim; return; } ;;
-        kde) have spectacle && { echo spectacle; return; } ;;
+        kde) [[ "$(session_type)" == wayland && -n "$(gui_bin)" ]] && { echo kwin; return; }
+             have spectacle && { echo spectacle; return; } ;;
         gnome) have gnome-screenshot && { echo gnome-screenshot; return; } ;;
     esac
     if [[ "$(session_type)" == x11 ]]; then
@@ -241,18 +255,54 @@ replay_seconds() {
     echo "$s"
 }
 
-video_source() {
-    local s="${CFG[video_source]}"
-    [[ "$s" != auto ]] && { echo "$s"; return; }
+# gpu-screen-recorder's monitors, one "NAME|WxH" per line.
+gsr_monitors() {
+    have gpu-screen-recorder || return 0
+    gpu-screen-recorder --list-monitors 2>/dev/null | grep -E '^[^|[:space:]]+[|]' || true
+}
+
+# The output KWin calls active (where the pointer / focus is), or nothing.
+kwin_active_output() {
+    local out t=()
+    have gdbus || return 0
+    have timeout && t=(timeout 3)
+    out="$("${t[@]}" gdbus call --session --timeout 2 -d org.kde.KWin -o /KWin \
+        -m org.kde.KWin.activeOutputName 2>/dev/null)" || return 0
+    [[ "$out" =~ ^\(\'([A-Za-z0-9_.:-]+)\',?\)$ ]] && echo "${BASH_REMATCH[1]}"
+    return 0
+}
+
+# The monitor you're on, where the desktop tells us; else nothing.
+active_monitor() {
     case "$(desktop)" in
-        hyprland) s="$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null || true)" ;;
-        sway) s="$(swaymsg -t get_outputs 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null || true)" ;;
-        *) s="" ;;
+        hyprland) hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null || true ;;
+        sway) swaymsg -t get_outputs 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null || true ;;
+        kde) kwin_active_output ;;
     esac
-    if [[ -z "$s" ]] && have gpu-screen-recorder; then
-        s="$(gpu-screen-recorder --list-monitors 2>/dev/null | head -n1 | cut -d'|' -f1 || true)"
+}
+
+# auto = the monitor you're on (checked when a recording / the replay
+# buffer starts), else the first one gpu-screen-recorder lists.
+video_source() {
+    local s="${CFG[video_source]}" list
+    [[ "$s" != auto ]] && { echo "$s"; return; }
+    s="$(active_monitor)"; s="${s%%$'\n'*}"
+    if [[ "$(desktop)" == kde || -z "$s" ]]; then
+        list="$(gsr_monitors | cut -d'|' -f1)"
+        # KWin's name must be one gsr can capture.
+        grep -qxF -- "$s" <<<"$list" || s="${list%%$'\n'*}"
     fi
     echo "${s:-screen}"
+}
+
+# clipped monitors: what gpu-screen-recorder can capture, the active one marked.
+cmd_monitors() {
+    have gpu-screen-recorder || die "gpu-screen-recorder is not installed"
+    local m a; a="$(active_monitor)"
+    while IFS= read -r m; do
+        [[ -n "$m" ]] || continue
+        if [[ -n "$a" && "${m%%|*}" == "$a" ]]; then echo "$m|active"; else echo "$m"; fi
+    done <<<"$(gsr_monitors)"
 }
 
 # pick_codec CONTAINER CODEC_LIST: best size/quality codec the GPU encodes.
@@ -415,9 +465,37 @@ focused_output() {
     esac
 }
 
+# slurp's dimmed selection as logical "X Y W H"; fails if cancelled.
+select_region() {
+    if dry; then echo "+ slurp -b #00000055 -c #ffffffcc -s #00000000 -w 2 -f '%x %y %w %h'" >&2; echo "X Y W H"; return; fi
+    local sel x y w h
+    sel="$(slurp -b '#00000055' -c '#ffffffcc' -s '#00000000' -w 2 -f '%x %y %w %h')" || return 1
+    read -r x y w h <<<"$sel"
+    [[ "$w" =~ ^[0-9]+$ && "$h" =~ ^[0-9]+$ ]] && ((w > 0 && h > 0)) || return 1
+    echo "$x $y $w $h"
+}
+
+# KDE Wayland: KWin's ScreenShot2 through clipped-gui (KWin authorizes it by
+# its .desktop entry). Region = slurp, then KWin grabs that logical area.
+# A failed grab (not a cancelled selection) is reported, not "cancelled".
+kwin_capture() {
+    local mode="$1" out="$2" gui args sel err
+    gui="$(gui_bin)"; args=("$mode")
+    if [[ "$mode" == region ]]; then
+        have slurp || fail "region on KDE needs slurp"
+        sel="$(select_region)" || return 1
+        read -ra args <<<"area $sel"
+    fi
+    if dry; then run "$gui" --grab "${args[@]}" "$out"; return; fi
+    err="$("$gui" --grab "${args[@]}" "$out" 2>&1)" && return 0
+    err="${err##*$'\n'}"
+    fail "screenshot failed: ${err#clipped-gui: }"
+}
+
 capture() {
     local mode="$1" out="$2" g
     case "$(capture_backend)" in
+        kwin) kwin_capture "$mode" "$out" ;;
         spectacle)
             local flag; case "$mode" in region) flag=-r ;; window) flag=-a ;; monitor) flag=-m ;; all) flag=-f ;; esac
             run spectacle -b -n "$flag" -o "$out" ;;
@@ -761,6 +839,10 @@ gv_str() { local s="${1//\\/"\\\\"}"; echo "'${s//\'/"\\'"}'"; }
 
 kde_id() { echo "[\"clipped-$1.desktop\",\"_launch\",\"clipped $1\",\"clipped $1\"]"; }
 kde_desktop() { echo "${XDG_DATA_HOME:-$HOME/.local/share}/applications/clipped-$1.desktop"; }
+kde_free() {  # kde_free KEYINT: no KDE shortcut holds this key
+    [[ "$(gdbus call --session -d org.kde.kglobalaccel -o /kglobalaccel \
+        -m org.kde.KGlobalAccel.isGlobalShortcutAvailable "$1" "" 2>/dev/null)" == "(true,)" ]]
+}
 kglobal() { runq gdbus call --session -d org.kde.kglobalaccel -o /kglobalaccel -m "org.kde.KGlobalAccel.$1" "${@:2}"; }
 
 kde_bind() {  # kde_bind ACTION SHORTCUT
@@ -773,12 +855,28 @@ kde_bind() {  # kde_bind ACTION SHORTCUT
             "$a" "$(desktop_arg "$CLIPPED_BIN")" "$a" >"$d"
     fi
     kglobal doRegister "$(kde_id "$a")"
-    if dry; then kglobal setShortcut "$(kde_id "$a")" "[$want]" 4; return 0; fi
-    # KGlobalAccel answers with the keys it really set; a taken combo comes back empty.
-    got="$(gdbus call --session -d org.kde.kglobalaccel -o /kglobalaccel \
-        -m org.kde.KGlobalAccel.setShortcut "$(kde_id "$a")" "[$want]" 4 2>/dev/null || true)"
-    [[ "$got" == *"[$want]"* ]] && return 0
-    warn "shortcut $2 taken, not bound ($a)"
+    # Flags 6 = SetPresent|NoAutoloading. Without SetPresent KDE stores the
+    # key but leaves the shortcut inactive, so pressing it does nothing.
+    if dry; then kglobal setShortcut "$(kde_id "$a")" "[$want]" 6; return 0; fi
+    # KGlobalAccel answers with the keys it really set. A taken combo comes
+    # back empty, but so does a free one while KDE hasn't yet picked up a
+    # just-written .desktop entry (seen taking ~1.5 s), so retry those.
+    local try
+    for try in {1..10}; do
+        got="$(gdbus call --session -d org.kde.kglobalaccel -o /kglobalaccel \
+            -m org.kde.KGlobalAccel.setShortcut "$(kde_id "$a")" "[$want]" 6 2>/dev/null || true)"
+        if [[ "$got" == *"[$want]"* ]]; then
+            [[ "$(gdbus call --session -d org.kde.kglobalaccel -o "/component/clipped_${a}_desktop" \
+                -m org.kde.kglobalaccel.Component.isActive 2>/dev/null)" == "(true,)" ]] \
+                || warn "KDE stored $2 but left it inactive ($a)"
+            return 0
+        fi
+        kde_free "$want" || break
+        sleep 0.3
+        kglobal doRegister "$(kde_id "$a")"
+    done
+    if kde_free "$want"; then warn "KDE did not accept $2, not bound ($a)"
+    else warn "shortcut $2 taken, not bound ($a)"; fi
     kde_unbind "$a"
     return 1
 }
@@ -1029,6 +1127,7 @@ main() {
         -h|--help|help) usage; return 0 ;;
         -v|--version) echo "clipped $VERSION"; return 0 ;;
         "") usage >&2; return 2 ;;
+        monitors) cmd_monitors; return ;;   # needs no config
     esac
     load_config
     case "$cmd" in

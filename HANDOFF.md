@@ -9,6 +9,275 @@ shortcuts, one config file; `bin/clipped` is the engine, `clipped-gui`
 `/videos`, copies to the clipboard, works on KDE, GNOME, Hyprland, Sway
 and X11. MIT, all our own code (no Hyprshot code).
 
+## Sora's check + real install (2026-10-17 ~21:58, uncommitted)
+
+Kevin: no Spectacle (users shouldn't install extra apps); video monitor
+pick always recorded the same screen; asked for the update installed.
+
+- Probes: the xdg Screenshot portal (interactive=false) never answered
+  in 15 s on KDE (likely a permission prompt), so it was not used. KWin
+  ScreenShot2 refuses ordinary callers (NoAuthorized) and allows a
+  binary whose canonical exe = absolute Exec of a .desktop entry with
+  `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2`. Never
+  authorize a general interpreter (python/gdbus/busctl).
+- gsr -w DP-1 vs -w DP-2: 3 s test recordings in /tmp gave different
+  frames, so gsr was fine; the bug was "auto" = first monitor on KDE.
+- Checks: bash -n ok; smoke "107 checks, all passed"; cargo test "43
+  passed"; clippy 0 warnings. `./install.sh` → installed bin + gui
+  cmp-equal; clipped.desktop has the X-KDE key and absolute Exec.
+  Installed `clipped monitor|all|window` with a temp config (save_dir
+  /tmp/clippedreal, notify/clipboard off): rc 0, 2560x1440 / 2560x2880
+  / 2560x1440, no spectacle process. `clipped monitors` →
+  DP-1|2560x1440, DP-2|2560x1440|active.
+- Restarted Kevin's tray (new binary) and clipped.service (still
+  -w DP-1 because his config says video_source = DP-1; left for him).
+- Still needs Kevin: a real key press, a real region drag, picking
+  "Monitor you're on (auto)". Region on KDE still needs slurp (not part
+  of Plasma); a built-in selector in clipped-gui would remove it.
+  GNOME: gnome-screenshot isn't preinstalled on GNOME 42+; the portal
+  would be the no-extra-app path there (not built).
+
+## Video source follows your monitor; Source combo (2026-10-17, Atlas, uncommitted for Sora's review)
+
+Kevin: "the monitor selection for videos is not working, it records the
+same monitor each time." Cause: `video_source = auto` on KDE/GNOME took
+the first `gpu-screen-recorder --list-monitors` line (always DP-1), and
+the GUI Source was a free text box with a small ⏷ menu.
+
+- `bin/clipped`: `active_monitor` = Hyprland/Sway focused output (as
+  before) or, on KDE, `kwin_active_output` (`gdbus call --session
+  --timeout 2 … org.kde.KWin.activeOutputName` under `timeout 3`; reply
+  must match `('NAME',)` with NAME in `[A-Za-z0-9_.:-]`). On KDE the name
+  is used only if gsr lists it; else the first listed monitor; else
+  `screen`. GNOME: first monitor (no simple Mutter call). A recording
+  resolves it at start; the replay buffer at daemon start.
+- New `clipped monitors` (runs before load_config, so a bad config
+  doesn't hide it): gsr's `NAME|WxH` lines, `|active` on the one you're
+  on; exit 1 "gpu-screen-recorder is not installed" without gsr.
+- Config comment: "auto = monitor you're on; or DP-1, portal, screen
+  (X11)" + a line pointing at `clipped monitors`.
+- GUI (`settings.rs`): Source is a ComboBox: "Monitor you're on
+  (auto)", each monitor "DP-2  2560x1440", "Pick each time (portal)",
+  "All monitors (X11 screen)" only when XDG_SESSION_TYPE=x11, and the
+  configured value if it is none of those ("DP-9 (not detected)"), so
+  it is never dropped. List comes from `clipped monitors` via
+  `clip_bin()` (GUI no longer runs gsr). "(looking for monitors…)" /
+  "(no monitors found)" hints. `needs_daemon_restart` (video_source is
+  in DAEMON_KEYS) keeps the existing "Restart service" offer. The
+  CLIPPED_GUI_SHOT self-shot now waits for the monitor list (cap 300
+  frames).
+- smoke.sh: fake gsr prints `FAKE_MONITORS`; a fake `gdbus` lives in
+  `$T/fakekwin` (only on PATH in the new checks, so kglobalaccel checks
+  are untouched). 7 new checks: KWin active → DP-2, record follows the
+  active monitor, unlisted/garbage/failed KWin → first, none listed →
+  screen, KWin not asked off KDE, `monitors` output + works with a bad
+  config, no gsr → exit 1.
+
+Checks run: `bash -n bin/clipped` ok; `bash tests/smoke.sh` "107
+checks, all passed"; `cargo test` "test result: ok. 43 passed" (3 new:
+monitors_parse, source_choices, video_source_change_offers_restart);
+`cargo clippy --all-targets` 0 warnings; `cargo build --release` ok,
+6,641,400 bytes. Real, read-only on Kevin's KDE: `bin/clipped monitors`
+→ `DP-1|2560x1440`, `DP-2|2560x1440|active`; with a temp auto config
+`--detect` followed KWin (DP-1 when KWin said DP-1). Self-shots of the
+settings window (temp dirs) show "DP-2  2560x1440" and "Monitor you're
+on (auto)". No recording made. shellcheck not installed.
+
+Not done: Kevin's real config still says `video_source = DP-1`, so he
+must pick "Monitor you're on (auto)" (or DP-2) and restart the service;
+needs reinstall into ~/.local first. Replay buffer stays on the monitor
+active at daemon start (switching it live would need a gsr restart).
+
+## KDE without Spectacle: KWin ScreenShot2 (2026-10-17, Atlas, uncommitted for Sora's review)
+
+Kevin: "Do we have to use Spectacle? I don't want users to have to
+install other applications." Sora found KWin authorizes ScreenShot2 by
+caller pid → /proc/pid/exe → a .desktop whose Exec (absolute,
+canonicalized) matches and has
+`X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2`.
+
+- `gui/src/grab.rs` (new): `clipped-gui --grab all|monitor|window|area
+  X Y W H OUT.png` → CaptureWorkspace / CaptureActiveScreen /
+  CaptureActiveWindow (decoration on, shadow off) / CaptureArea, with
+  native-resolution true, include-cursor false. Pipe read on a thread
+  during the call; stride handled (last row may be short); QImage
+  formats 4/5/6 and 16/17/18, unknown = error. Opaque shots are written
+  as RGB PNG, else RGBA; written to `.OUT.part` then renamed. Exit 0 ok,
+  1 + one stderr line on failure (NoAuthorized → "not authorized: is
+  clipped.desktop installed with an absolute Exec and X-KDE-…?"), 2 on
+  bad args. zbus =5.15.0 is now a direct dep (tokio + blocking-api);
+  Cargo.lock only gained the "zbus" line under clipped-gui, no new crate.
+- `bin/clipped`: backend `kwin` when desktop=kde, session=wayland and
+  `gui_bin` finds clipped-gui (`$CLIPPED_GUI` only, if set; else next to
+  the script; else PATH). Region = `select_region` (same slurp dim args)
+  → `--grab area X Y W H`. A failed grab now ends with a toast +
+  "clipped: screenshot failed: <reason>" (rc 1) instead of "cancelled".
+  `kde_region`/`kde_layout` (full grab + ffmpeg crop + kscreen-doctor)
+  are gone. Spectacle stays as fallback (no clipped-gui, or KDE X11).
+  Non-png formats use the same ffmpeg conversion as before.
+- `install.sh`: clipped.desktop gets the X-KDE key; Exec stays the
+  final `$PREFIX` path (never DESTDIR). desktop-file-validate: rc 0, no
+  output.
+- smoke.sh: `CLIPPED_GUI` points at a fake clipped-gui (logs args,
+  writes "png"; FAKE_GUI=fail mimics NoAuthorized). New checks: kde
+  wayland → kwin, no clipped-gui → not kwin, x11 → not kwin, gui_bin
+  next to script, kwin monitor/all, spectacle fallback flags (fake
+  spectacle), real-mode kwin with fake gui+slurp (saves png, failed grab
+  message, cancelled selection never calls the gui). Region/window webp
+  checks now expect `--grab`. Install check expects the X-KDE line.
+- Lesson: KDE still needs **slurp** for region (separate package).
+  Replacing it with our own overlay in clipped-gui would remove the last
+  extra tool on KDE; not done.
+
+Checks run: `bash -n bin/clipped` ok; `bash tests/smoke.sh` "100 checks,
+all passed" (15 s); `cargo test` "test result: ok. 40 passed" (5 new in
+grab); `cargo clippy --all-targets` no warnings; `cargo build --release`
+ok, 6,637,288 bytes. `DESTDIR=… PREFIX=/usr/local ./install.sh
+--no-build` → entry has the key, validates; `--uninstall` left 0 files.
+Real KWin check (temp `~/.local/share/applications/clipped-grabtest.desktop`
+→ gui/target/release/clipped-gui, deleted afterwards): all 2560x2880
+(4.4 MB), monitor 2560x1440 (717 KB), window 1280x1394 (252 KB), area
+100 100 640 360 → 640x360 (70 KB), all rc 0, RGB PNGs, luma 0–255
+(not blank). Without the entry: rc 1, the "not authorized" line, no file.
+Not done: reinstall into ~/.local (Sora), a real shortcut press, real
+slurp drag → kwin area on Kevin's screens (HiDPI/scale ≠ 1 untested).
+Note: until reinstall, ~/.local/bin/clipped-gui is the old binary
+without --grab, but the installed bin/clipped is also old, so shortcuts
+keep using Spectacle until both are replaced.
+
+## KDE shortcuts were inactive; grim on KDE (2026-10-17, Sora, uncommitted)
+
+Kevin: Record captures keys fine, but pressing a bound key does
+nothing; wants only grim + slurp for screenshots.
+
+- Cause: `kde_bind` called `setShortcut … 4` (NoAutoloading only).
+  KDE stored the keys (kglobalshortcutsrc, globalShortcutsByKey all
+  looked right), but every `/component/clipped_*_desktop`
+  `Component.isActive` was `(false,)`, so KWin never grabbed them.
+  The journal showed no `app-clipped\x2d<action>@` launch ever. Now it
+  passes flags 6 (SetPresent|NoAutoloading), and after a successful
+  set it warns "KDE stored … but left it inactive" if isActive is
+  false. The smoke test now expects `6`.
+- Lesson: checking for a bound KDE shortcut means checking
+  `Component.isActive`, not only the stored keys.
+  `invokeShortcut` works on inactive shortcuts, so it proves nothing
+  about key presses.
+- grim on KDE: still impossible. grim 1.5.0 on KWin 6.7.5 →
+  "compositor doesn't support the screen capture protocol";
+  wayland-info lists zwlr_layer_shell_v1 but neither wlr-screencopy
+  nor ext-image-copy-capture. So KDE keeps `spectacle -b -n` (no UI)
+  as the grabber, with slurp as the selector. grim + slurp are already
+  the backend on Hyprland/Sway. Kevin asked for grim only; told him
+  why it can't work on KDE. No change made.
+
+Checks: `bash tests/smoke.sh` "95 checks, all passed";
+`./install.sh --no-build`, cmp equal; real `clipped bind` rc 0, then
+isActive `(true,)` for all 6. Not checked: a real key press (needs
+Kevin).
+
+## KDE bind retry, own region selector, Record capture (2026-10-17, uncommitted)
+
+Kevin: "changed the keybinds and it's still not working"; then asked for
+a Record button capturing up to 3 keys (+ Stop), and a region mode that
+dims the screens instead of Spectacle's selector.
+
+- Bind bug (Sora): binds state held only region + window. Real
+  `clipped bind` warned "Meta+Alt+A/C/V taken", but
+  `isGlobalShortcutAvailable` said free and globalShortcutsByKey had no
+  owner. Probes (temp `clipped-probe-*.desktop`, removed) showed
+  kglobalaccel returns `@ai []` for a free key right after a new
+  .desktop entry is written, and accepts it on try 1–4 at 0.5 s steps.
+  `kde_bind` now retries up to 10x/0.3 s while `kde_free` (new) says
+  the key is free, and warns "KDE did not accept" vs "taken". After
+  reinstall, real `clipped bind`: rc 0, 1.4 s, all 6 lines in binds;
+  globalShortcutsByKey shows each key owned by clipped-<action>.desktop.
+  kbuildsycoca6 before register was tried and did not help.
+- Region on KDE Wayland (Sora): `kde_region` = `spectacle -b -n -f`
+  full grab (0.64 s, 2560x2880 on Kevin's stacked DP-1/DP-2), then
+  `slurp -b #00000055` (dims the *live* screens; not a frozen image),
+  then ffmpeg crop scaled by `kde_layout` (kscreen-doctor -j; fallback
+  1:1). Used only when session is wayland and slurp + ffmpeg exist;
+  else `spectacle -r` as before. Empty selection = cancelled. Crop
+  maths checked on a generated 2560x2880 image (matches plain crop).
+  smoke region test now uses fake slurp/ffmpeg in `$T/fakeregion`.
+  Not checked: slurp overlay on KWin with a real drag (needs Kevin).
+- Record/Stop (Atlas): settings.rs wraps eframe with
+  `eframe::create_native` + `KeyTap` winit handler, so Meta and Print
+  are seen (egui drops them). Up to 3 keys, stops on release or Stop,
+  Esc cancels; fills the Meta/Ctrl/Alt/Shift + key list editor.
+  gui/Cargo.toml: `winit = "=0.30.13"` (already in the tree). Combos
+  KDE already owns (incl. ours) are grabbed by KWin first; the UI hints
+  to press Stop and pick from the list. blockGlobalShortcuts not used
+  (global flag, would stay on if we crash).
+- Nova review: no blockers; X11 slurp gate and noisy 0x0 cancel fixed.
+  Open: no tests for real-mode slurp cancel / kde_bind retry (fake
+  gdbus) / spectacle -r fallback; rotated screens in kde_layout; Record
+  with only modifiers held gives no key; non-Latin layouts refused.
+
+Checks: `bash tests/smoke.sh` "95 checks, all passed"; `cargo test`
+"35 passed"; `cargo clippy --all-targets` no warnings; `./install.sh`
+then cmp equal for both binaries. Nova: settings window opens via the
+new event loop (CLIPPED_GUI_SHOT, rc 0). Not done: real key presses in
+Record, a real region drag, commit. Replay key needs `clipped service
+on` (daemon not running).
+
+## Shortcut editor + bind on Save (2026-10-17, Atlas, uncommitted for Sora's review)
+
+Kevin installed it and reported (1) Meta+Print can't be set in the
+settings window, (2) shortcuts take no pictures. Sora's diagnosis:
+egui 0.33 has no Print key and sees Meta only on macOS; and Save never
+ran `clipped bind` (no binds state, no daemon), so nothing was ever
+registered with KDE. Capture itself works. Changes, all in
+`gui/src/settings.rs`:
+
+- One-shot key capture and the "add Meta" box are gone. Record (empty
+  field) / Change opens an editor under the Shortcuts grid: Meta / Ctrl
+  / Alt / Shift boxes, a key list (`key_choices`: Print first, Pause …
+  Return, F1–F24, A–Z, 0–9; all accepted by key_info), live preview,
+  Set / Cancel. Prefill parses the field case-insensitively
+  (Super/Win = Meta, PageUp = PgUp, F25–F35 kept); an empty field
+  starts with Meta on. A key egui sees fills the key + Ctrl/Alt/Shift
+  (Meta box untouched); Esc alone cancels. Keys are ignored while a
+  text box has focus, so typing a value still works.
+- Save runs `clipped bind` if any bind.* changed OR
+  `$XDG_STATE_HOME/clipped/binds` doesn't exist yet. "Shortcuts apply
+  when clipped starts" is gone. `clipped bind` needs no daemon
+  (with_bind_lock only makes RUNDIR). When never bound and nothing is
+  edited, the Shortcuts section shows "Shortcuts are not active." +
+  "Turn on shortcuts" (runs the same rebind).
+- Tests: `shortcut_parse_and_text`, `key_choices_match_clipped`,
+  `first_save_binds` (new); `save_flow` now expects the bind. Every test
+  whose Save succeeds calls `wait_rebind` before it ends, so a bind
+  thread can't outlive env_lock and log into the next test's calls.
+
+Known gap: on a desktop with no bind backend ("manual"), `clipped bind`
+writes no state, so "Turn on shortcuts" stays shown, and its stdout
+(the manual list) isn't shown in the GUI.
+
+Checks run: `cargo test` "test result: ok. 32 passed"; `cargo clippy
+--all-targets` no warnings; `bash tests/smoke.sh` "95 checks, all
+passed". Mutation: with the old bind rule put back, `first_save_binds`
+fails. `shots/gui-shortcuts.png` = settings frame (temp env, dry run)
+with Change buttons + "Turn on shortcuts". No shot of the open editor:
+no input tool (xdotool/ydotool/wtype) and no test hook wanted.
+Not done: real bind on Kevin's session, install, commit.
+
+Sora's check (21:00): `cargo test` "32 passed", clippy no output,
+smoke "95 checks, all passed"; diff read. Diagnosis evidence: real
+`CLIPPED_CONFIG=/tmp/cpk/config clipped monitor` rc 0, PNG saved; a
+temporary kglobalaccel probe entry (`clipped-probe.desktop`, Meta+Alt+F12,
+invoked with Component.invokeShortcut, then unregistered and deleted)
+also saved a PNG. So shortcut-launched capture works on KDE Wayland
+with nothing focused; XWayland is not needed (and an X11 client can't
+capture the Wayland screen). Kevin had cleared all Spectacle shortcuts
+(Meta+Print free) and tried `pacman -R spectacle` at 20:48; it is still
+installed (plasma-meta needs it), and Clipped needs it on KDE. Then
+`./install.sh` rebuilt and reinstalled into ~/.local (binary cmp equal
+to gui/target/release). The tray/settings processes Kevin had open
+still run the old binary until he quits and reopens them. Kevin's real
+shortcuts were not bound by us; he presses Save / "Turn on shortcuts".
+Lesson: egui can't be the only way to enter a shortcut on Linux.
+
 ## Rename to Clipped (2026-10-17, Kevin asked; Atlas did it, Sora checked)
 
 Kevin renamed the app "clip" -> "Clipped" to avoid clashing with other
@@ -378,4 +647,13 @@ GUI below plus fixes for Nova's round-3 review (next section).
 - clip round 3 review fixes (2026-10-17, Atlas, uncommitted): all of Nova's 10 items are fixed. The GUI config parser/writer now works on bytes (lossless for non-UTF-8). Only NotFound counts as "no config"; any other read error turns Save off. bash load_config/parse_shortcut use local LC_ALL=C. bind/unbind are flocked on $RUNDIR/bind.lock. install.sh writes a manifest at $PREFIX/share/clip/installed; uninstall removes only what it lists and, without DESTDIR, stops clip-gui, runs service off + unbind and removes our autostart entry. Install refuses a foreign bin/clip unless --force. smoke = 95 checks, cargo test = 29. GUI tests use testutil::env_lock + test_env (dry run). Never run a real-mode install.sh --uninstall in tests without a fake bin/clip. (Atlas, 2026-10-17)
 - clip 0.2.0 committed 2026-10-17 (884e8d6, local): Rust clip-gui in gui/ (eframe settings window + ksni tray showing idle/replay/recording from RUNDIR pid files), install.sh (PREFIX/DESTDIR, manifest, --uninstall, --force), Clip start-menu entry (Exec=clip-gui --open), "Start tray at login" checkbox writes autostart. GUI validates via `clip check` before atomic rename. Checks: smoke 95, cargo test 29. Not installed for real yet; Kevin runs ./install.sh. (Sora, 2026-10-18)
 - clip renamed to clipped (2026-10-17, Atlas, uncommitted for Sora's review): bin/clipped, clipped-gui crate/binary, gui/icons/clipped*.svg/png, config ~/.config/clipped/config, <save_dir>/clipped/{images,videos}, XDG dirs .../clipped, clipped.service, KDE clipped-<action>.desktop, notify -a clipped, Name=Clipped, manifest share/clipped/installed, env CLIPPED_* (DRY_RUN, CONFIG, BIN, GUI_SHOT, BIND_WAIT, STOP_WAIT). Repo folder stays /home/kevin/Workspace/clip. Window/tray titles "Clipped"; "Clip saved" toast (video clip) kept. Checks after rename: smoke 95 pass, cargo test 29 pass, clippy clean. (Atlas, 2026-10-18)
+- App renamed clip -> Clipped 2026-10-17 (commit 07e34ab, local): bin/clipped, clipped-gui, ~/.config/clipped/config, <save_dir>/clipped/{images,videos}, CLIPPED_* env vars, clipped.service, clipped-<action>.desktop. Repo folder stays /home/kevin/Workspace/clip. Recording = gpu-screen-recorder on GPU (VAAPI on Kevin's AMD RX 9070, auto picks av1); only the X11 ffmpeg fallback is CPU. Checks: smoke 95, cargo test 29. (Sora, 2026-10-18)
+- Clipped shortcut fix (2026-10-17, Atlas, uncommitted for Sora's review): settings.rs now has a shortcut editor (Meta/Ctrl/Alt/Shift boxes + key list with Print first, Set/Cancel) instead of key capture; Save runs `clipped bind` when bind.* changed or no $XDG_STATE_HOME/clipped/binds exists; "Turn on shortcuts" button when never bound. cargo test 32 pass, clippy clean, smoke 95 pass. Known gap: manual-backend desktops never write binds state, so the button stays. (Atlas, 2026-10-18)
+- Clipped 2026-10-17: Kevin's "no pictures" = shortcuts never bound (GUI Save didn't run `clipped bind`); capture via spectacle works from KDE shortcuts on Wayland (XWayland not needed). egui has no Print key and no Meta on Linux, so settings now has a Meta/Ctrl/Alt/Shift + key-list editor; Save binds when never bound. Reinstalled to ~/.local, uncommitted. Kevin cleared Spectacle's shortcuts and tried removing spectacle (plasma-meta keeps it) — Clipped needs spectacle on KDE. (Sora, 2026-10-18)
+- Clipped Record capture (2026-10-17, Atlas, uncommitted): egui-winit 0.33.3 drops Super on Linux (mac_cmd only on macOS) and has no Print key, and eframe gives no winit-event hook. settings::run now uses eframe::create_native on its own winit EventLoop, wrapped in KeyTap (an ApplicationHandler that copies KeyboardInput/Focused into a queue), so Record sees Meta and Print. Added direct dep winit =0.30.13 (default-features=false), which was already in Cargo.lock, so no new crate. Recorder = pure state machine (max 3 keys, ends on release or at 3, Stop, Esc alone cancels). Checks: cargo test 35 passed, clippy clean, smoke 95 passed. Real key presses not tested: no input tool on the machine. (Atlas, 2026-10-18)
+- Clipped 2026-10-17 (uncommitted, installed to ~/.local): KDE binds silently failed because kglobalaccel rejects a free key for ~1.5 s after a new clipped-<action>.desktop is written; kde_bind now retries while isGlobalShortcutAvailable is true. All 6 of Kevin's keys bound (Meta+Alt+Print region, Meta+Print window, Meta+Ctrl+Print monitor, Meta+Alt+A/C/V). KDE Wayland region = spectacle -b -n -f grab + slurp dim (#00000055) + ffmpeg crop (Kevin doesn't want Spectacle's selector). KWin has layer-shell but no screencopy, so grim can't capture on KDE. GUI Record/Stop captures up to 3 keys via winit KeyTap (winit =0.30.13). cargo test 35, smoke 95. (Sora, 2026-10-18)
+- Clipped 2026-10-17: KDE shortcuts never fired because kde_bind used setShortcut flags 4; needs 6 (SetPresent) or Component.isActive stays false (keys look stored but aren't grabbed). Fixed + installed, all 6 active. Verify binds via /component/clipped_<a>_desktop isActive. grim can't work on KWin 6.7.5 (no wlr-screencopy/ext-image-copy-capture), so KDE keeps spectacle -b -n + slurp. (Sora, 2026-10-17) (Sora, 2026-10-18)
+- Clipped KDE without Spectacle (2026-10-17, Atlas, uncommitted): clipped-gui --grab all|monitor|window|area X Y W H OUT.png (gui/src/grab.rs, zbus =5.15.0 blocking, no new crates) calls KWin ScreenShot2; KWin authorizes it via clipped.desktop Exec + X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2 (install.sh writes it). bin/clipped backend "kwin" on KDE Wayland when clipped-gui found ($CLIPPED_GUI, next to script, PATH); region = slurp → --grab area; spectacle only fallback; kde_region/kde_layout removed. Real KWin grabs verified (all 2560x2880, monitor 2560x1440). Region still needs slurp. Checks: smoke 100, cargo test 40, clippy clean. (Atlas, 2026-10-18)
+- Clipped video source (2026-10-17, Atlas, uncommitted): video_source=auto now = monitor you're on (KDE: KWin activeOutputName via gdbus, must be in gsr --list-monitors; Hyprland/Sway focused; else first). New `clipped monitors` (NAME|WxH[|active]). GUI Source = ComboBox fed by `clipped monitors` (auto / each monitor / portal / screen on X11 / unknown value kept). Replay picks the monitor at daemon start. Checks: smoke 107, cargo test 43, clippy clean. Kevin's config still has video_source = DP-1. (Atlas, 2026-10-18)
+- Clipped 2026-10-17 (uncommitted, installed to ~/.local): KDE Wayland screenshots no longer use Spectacle. `clipped-gui --grab all|monitor|window|area X Y W H OUT` calls KWin org.kde.KWin.ScreenShot2 via zbus; KWin authorizes it because clipped.desktop has absolute Exec + X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2 (never authorize python/gdbus). Spectacle = fallback only. Region still uses slurp. video_source auto on KDE = KWin activeOutputName; `clipped monitors`; GUI Source is a combo. smoke 107, cargo test 43. (Sora, 2026-10-18)
 <!-- workspace:memory:end -->

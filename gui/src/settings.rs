@@ -22,13 +22,282 @@ fn is_text_key(k: &str) -> bool {
 
 enum Msg {
     Folder(PathBuf),
-    Monitors(Vec<String>),
+    Monitors(Vec<Monitor>),
     Status(String, bool),
     /// Result of `clipped bind`; it replaces "Updating shortcuts…" in the status.
     Rebind(String, bool),
 }
 
+/// self_shot's frame count once the screenshot is asked for.
+const SHOT_SENT: u32 = u32::MAX;
+
 const UPDATING: &str = "Updating shortcuts…";
+
+const ACTION_NAMES: [&str; 6] = ["Region", "Window", "Monitor", "All monitors", "Save replay", "Record"];
+
+/// The keys the editor offers (bin/clipped key_info takes them all, plus
+/// F25–F35 and spelling variants).
+fn key_choices() -> Vec<String> {
+    let mut v: Vec<String> = [
+        "Print", "Pause", "Ins", "Del", "Home", "End", "PgUp", "PgDown", "Left", "Right", "Up", "Down", "Space",
+        "Tab", "Esc", "Backspace", "Return",
+    ]
+    .map(String::from)
+    .to_vec();
+    v.extend((1..=24).map(|n| format!("F{n}")));
+    v.extend(('A'..='Z').map(String::from));
+    v.extend(('0'..='9').map(String::from));
+    v
+}
+
+/// The editor's name for a key part ("print", "PageUp", "f30"), None if
+/// clipped doesn't know it.
+fn canonical_key(part: &str) -> Option<String> {
+    let l = part.to_ascii_lowercase();
+    let l = match l.as_str() {
+        "escape" => "esc", "enter" => "return", "insert" => "ins", "delete" => "del",
+        "pageup" => "pgup", "pagedown" => "pgdown", x => x,
+    };
+    if let Some(k) = key_choices().into_iter().find(|k| k.to_ascii_lowercase() == l) {
+        return Some(k);
+    }
+    // F25–F35: clipped takes them, the list stops at F24.
+    (l.starts_with('f') && config::valid_shortcut(l)).then(|| l.to_ascii_uppercase())
+}
+
+/// A shortcut as the editor's checkboxes and key list see it.
+#[derive(Debug, Default, PartialEq)]
+struct Shortcut {
+    meta: bool,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    key: String,
+}
+
+impl Shortcut {
+    /// Prefill from a field: parts in any case, Super/Win = Meta, unknown
+    /// keys dropped. An empty field starts with Meta on.
+    fn parse(s: &str) -> Shortcut {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        if s.is_empty() {
+            return Shortcut { meta: true, ..Default::default() };
+        }
+        let mut sc = Shortcut::default();
+        for part in s.split('+') {
+            match part.to_ascii_lowercase().as_str() {
+                "meta" | "super" | "win" => sc.meta = true,
+                "ctrl" | "control" => sc.ctrl = true,
+                "alt" => sc.alt = true,
+                "shift" => sc.shift = true,
+                _ if sc.key.is_empty() => sc.key = canonical_key(part).unwrap_or_default(),
+                _ => {}
+            }
+        }
+        sc
+    }
+
+    /// "Meta+Ctrl+Alt+Shift+Key", the order clipped's defaults use.
+    fn text(&self) -> String {
+        let mods = [(self.meta, "Meta"), (self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift")];
+        let mut parts: Vec<&str> = mods.iter().filter(|m| m.0).map(|m| m.1).collect();
+        if !self.key.is_empty() {
+            parts.push(&self.key);
+        }
+        parts.join("+")
+    }
+}
+
+/// One key as Record sees it.
+#[derive(Clone, Debug, PartialEq)]
+enum Part {
+    Meta,
+    Ctrl,
+    Alt,
+    Shift,
+    Key(String),
+}
+
+/// A key event for Record, from winit (see KeyTap).
+#[derive(Clone, Debug, PartialEq)]
+enum KeyEv {
+    Down(Part),
+    Up(Part),
+    /// A key clipped can't bind (comma, AltGr, …) was pressed.
+    Other,
+    /// The window lost focus: releases may never come.
+    Reset,
+}
+
+enum Rec {
+    Going,
+    Done(Shortcut),
+    Cancel,
+}
+
+/// Record: collects up to 3 keys of one combo. It ends when 3 are held,
+/// or when a key of a combo with a non-modifier key goes up. A combo of
+/// modifiers only stays shown (for Stop) until the next press starts over.
+#[derive(Debug, Default)]
+struct Recorder {
+    held: Vec<Part>,
+    combo: Vec<Part>,
+    refused: bool,
+}
+
+impl Recorder {
+    fn has_key(&self) -> bool {
+        self.combo.iter().any(|p| matches!(p, Part::Key(_)))
+    }
+
+    fn feed(&mut self, ev: KeyEv) -> Rec {
+        match ev {
+            KeyEv::Down(p) => {
+                if self.held.is_empty() {
+                    self.combo.clear();
+                    self.refused = false;
+                }
+                if p == Part::Key("Esc".into()) && self.held.is_empty() {
+                    return Rec::Cancel;
+                }
+                if self.held.contains(&p) {
+                    return Rec::Going;
+                }
+                self.held.push(p.clone());
+                if self.combo.len() < 3 && !self.combo.contains(&p) {
+                    // clipped takes one key: a second one replaces the first.
+                    if matches!(p, Part::Key(_)) {
+                        self.combo.retain(|q| !matches!(q, Part::Key(_)));
+                    }
+                    self.combo.push(p);
+                }
+                if self.combo.len() == 3 {
+                    return Rec::Done(self.shortcut());
+                }
+            }
+            KeyEv::Up(p) => {
+                // Keys already down when Record started don't count.
+                if !self.held.contains(&p) {
+                    return Rec::Going;
+                }
+                self.held.retain(|q| *q != p);
+                if self.has_key() {
+                    return Rec::Done(self.shortcut());
+                }
+            }
+            KeyEv::Other => self.refused = true,
+            KeyEv::Reset => self.held.clear(),
+        }
+        Rec::Going
+    }
+
+    /// What Stop takes: the combo so far (maybe no key yet).
+    fn shortcut(&self) -> Shortcut {
+        let has = |p: Part| self.combo.contains(&p);
+        let key = self.combo.iter().find_map(|p| match p {
+            Part::Key(k) => Some(k.clone()),
+            _ => None,
+        });
+        Shortcut { meta: has(Part::Meta), ctrl: has(Part::Ctrl), alt: has(Part::Alt), shift: has(Part::Shift), key: key.unwrap_or_default() }
+    }
+}
+
+/// Record's name for a winit key (layout-aware, Shift not applied).
+fn winit_part(k: &winit::keyboard::Key) -> Option<Part> {
+    use winit::keyboard::{Key, NamedKey};
+    match k {
+        Key::Named(NamedKey::Super | NamedKey::Meta) => Some(Part::Meta),
+        Key::Named(NamedKey::Control) => Some(Part::Ctrl),
+        Key::Named(NamedKey::Alt) => Some(Part::Alt),
+        Key::Named(NamedKey::Shift) => Some(Part::Shift),
+        Key::Named(n) => {
+            let name = format!("{n:?}");
+            let name = match name.as_str() {
+                "PrintScreen" => "Print",
+                n => n.strip_prefix("Arrow").unwrap_or(n),
+            };
+            canonical_key(name).map(Part::Key)
+        }
+        Key::Character(c) if c.len() == 1 => canonical_key(c).map(Part::Key),
+        _ => None,
+    }
+}
+
+type KeyQueue = std::sync::Arc<std::sync::Mutex<Vec<KeyEv>>>;
+
+/// Wraps eframe's winit handler and copies key events into a queue before
+/// egui sees them: egui-winit 0.33 has no Print key and reports Super only
+/// on macOS, but winit has both.
+struct KeyTap<'a> {
+    inner: eframe::EframeWinitApplication<'a>,
+    keys: KeyQueue,
+}
+
+impl winit::application::ApplicationHandler<eframe::UserEvent> for KeyTap<'_> {
+    fn resumed(&mut self, el: &winit::event_loop::ActiveEventLoop) {
+        self.inner.resumed(el);
+    }
+
+    fn window_event(&mut self, el: &winit::event_loop::ActiveEventLoop, id: winit::window::WindowId, event: winit::event::WindowEvent) {
+        use winit::event::{ElementState, WindowEvent};
+        use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+        let ev = match &event {
+            WindowEvent::KeyboardInput { event: k, is_synthetic: false, .. } if !k.repeat => {
+                let pressed = k.state == ElementState::Pressed;
+                match (winit_part(&k.key_without_modifiers()), pressed) {
+                    (Some(p), true) => Some(KeyEv::Down(p)),
+                    (Some(p), false) => Some(KeyEv::Up(p)),
+                    (None, true) => Some(KeyEv::Other),
+                    (None, false) => None,
+                }
+            }
+            WindowEvent::Focused(false) => Some(KeyEv::Reset),
+            _ => None,
+        };
+        if let (Some(ev), Ok(mut q)) = (ev, self.keys.lock()) {
+            if q.len() < 64 {
+                q.push(ev);
+            }
+        }
+        self.inner.window_event(el, id, event);
+    }
+
+    fn new_events(&mut self, el: &winit::event_loop::ActiveEventLoop, cause: winit::event::StartCause) {
+        self.inner.new_events(el, cause);
+    }
+
+    fn user_event(&mut self, el: &winit::event_loop::ActiveEventLoop, event: eframe::UserEvent) {
+        self.inner.user_event(el, event);
+    }
+
+    fn device_event(&mut self, el: &winit::event_loop::ActiveEventLoop, id: winit::event::DeviceId, event: winit::event::DeviceEvent) {
+        self.inner.device_event(el, id, event);
+    }
+
+    fn about_to_wait(&mut self, el: &winit::event_loop::ActiveEventLoop) {
+        self.inner.about_to_wait(el);
+    }
+
+    fn suspended(&mut self, el: &winit::event_loop::ActiveEventLoop) {
+        self.inner.suspended(el);
+    }
+
+    fn exiting(&mut self, el: &winit::event_loop::ActiveEventLoop) {
+        self.inner.exiting(el);
+    }
+
+    fn memory_warning(&mut self, el: &winit::event_loop::ActiveEventLoop) {
+        self.inner.memory_warning(el);
+    }
+}
+
+/// The open shortcut editor: which bind.* it edits and the value so far.
+struct Editor {
+    field: &'static str,
+    sc: Shortcut,
+    /// Record is listening.
+    rec: Option<Recorder>,
+}
 
 struct App {
     path: PathBuf,
@@ -36,8 +305,9 @@ struct App {
     vals: BTreeMap<String, String>,
     autostart_loaded: bool,
     autostart: bool,
-    capture: Option<&'static str>,
-    capture_meta: bool,
+    editor: Option<Editor>,
+    /// Key events from KeyTap; None in tests (Record is off then).
+    keys: Option<KeyQueue>,
     status: String,
     error: bool,
     /// Set when the config exists but can't be read: Save is off, so the
@@ -46,7 +316,8 @@ struct App {
     /// A `clipped bind` is in flight; Save waits for it.
     rebinding: bool,
     offer_restart: bool,
-    monitors: Vec<String>,
+    /// From `clipped monitors`; None until it answers.
+    monitors: Option<Vec<Monitor>>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     ctx: egui::Context,
@@ -64,7 +335,23 @@ pub fn run() -> i32 {
         viewport = viewport.with_icon(egui::IconData { rgba, width: w, height: h });
     }
     let opts = eframe::NativeOptions { viewport, ..Default::default() };
-    match eframe::run_native("Clipped", opts, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx))))) {
+    // run_native, but on our own event loop so KeyTap sees winit's keys.
+    let event_loop = match winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event().build() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("clipped-gui: {e}");
+            return 1;
+        }
+    };
+    let keys = KeyQueue::default();
+    let app_keys = keys.clone();
+    let creator: eframe::AppCreator = Box::new(move |cc| {
+        let mut app = App::new(&cc.egui_ctx);
+        app.keys = Some(app_keys);
+        Ok(Box::new(app))
+    });
+    let mut tap = KeyTap { inner: eframe::create_native("Clipped", opts, creator, &event_loop), keys };
+    match event_loop.run_app(&mut tap) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("clipped-gui: {e}");
@@ -233,14 +520,14 @@ impl App {
             vals: BTreeMap::new(),
             autostart_loaded: false,
             autostart: false,
-            capture: None,
-            capture_meta: true,
+            editor: None,
+            keys: None,
             status: String::new(),
             error: false,
             read_error: None,
             rebinding: false,
             offer_restart: false,
-            monitors: Vec::new(),
+            monitors: None,
             tx,
             rx,
             ctx: ctx.clone(),
@@ -252,15 +539,7 @@ impl App {
         }
         let (tx, ctx) = (app.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let out = Command::new("gpu-screen-recorder").arg("--list-monitors").output();
-            let list = out
-                .map(|o| {
-                    String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .filter_map(|l| l.split('|').next().filter(|s| !s.is_empty()).map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let list = run_clip(&["monitors"], None).map(|o| parse_monitors(&o.stdout)).unwrap_or_default();
             let _ = tx.send(Msg::Monitors(list));
             ctx.request_repaint();
         });
@@ -277,7 +556,7 @@ impl App {
         self.vals = self.loaded.clone();
         self.autostart_loaded = state::autostart_file().exists();
         self.autostart = self.autostart_loaded;
-        self.capture = None;
+        self.editor = None;
         self.offer_restart = false;
         let error = read_error.is_some();
         self.read_error = read_error;
@@ -350,15 +629,12 @@ impl App {
         }
         self.load();
         let daemon = Status::read(Path::new("/proc"), &state::rundir()).daemon;
-        if changes.keys().any(|k| k.starts_with("bind.")) {
-            if daemon || state::binds_state().exists() {
-                notes.push(UPDATING.into());
-                self.rebind();
-            } else {
-                notes.push("Shortcuts apply when clipped starts.".into());
-            }
+        // Never bound: a first Save turns shortcuts on (clipped bind needs no daemon).
+        if changes.keys().any(|k| k.starts_with("bind.")) || !state::binds_state().exists() {
+            notes.push(UPDATING.into());
+            self.rebind();
         }
-        if daemon && changes.keys().any(|k| DAEMON_KEYS.contains(&k.as_str())) {
+        if daemon && needs_daemon_restart(&changes) {
             if crate::tray::service_active() {
                 self.offer_restart = true;
                 notes.push("Restart the service to use the new video settings.".into());
@@ -369,6 +645,11 @@ impl App {
         let error = !errors.is_empty();
         notes.extend(errors);
         self.set_status(notes.join(" "), error);
+    }
+
+    /// clipped never bound anything and Save won't: offer "Turn on shortcuts".
+    fn shortcuts_inactive(&self) -> bool {
+        !self.dirty() && !self.rebinding && self.read_error.is_none() && !state::binds_state().exists()
     }
 
     fn write_autostart(&self) -> Result<(), String> {
@@ -444,7 +725,7 @@ impl App {
                     };
                     self.vals.insert("save_dir".into(), v);
                 }
-                Msg::Monitors(l) => self.monitors = l,
+                Msg::Monitors(l) => self.monitors = Some(l),
                 Msg::Status(s, e) => self.set_status(s, e),
                 Msg::Rebind(s, e) => {
                     self.rebinding = false;
@@ -459,44 +740,67 @@ impl App {
         }
     }
 
-    /// While a shortcut field records, the next key press (with Ctrl/Alt/
-    /// Shift) becomes its value. egui can't see Meta on Linux, hence the toggle.
-    fn capture_keys(&mut self, ctx: &egui::Context) {
-        let Some(field) = self.capture else { return };
+    /// While the editor is open but not recording, a key press egui sees
+    /// fills the key and Ctrl/Alt/Shift (egui on Linux sees neither Meta nor
+    /// Print, so the Meta box is left alone; Record sees both). Esc alone
+    /// cancels.
+    fn edit_keys(&mut self, ctx: &egui::Context) {
+        self.record_keys(ctx);
+        if self.editor.is_none() || ctx.wants_keyboard_input() {
+            return;
+        }
         let events = ctx.input(|i| i.events.clone());
         for e in events {
             if let egui::Event::Key { key, pressed: true, modifiers, .. } = e {
                 if key == egui::Key::Escape && !modifiers.any() {
-                    self.capture = None;
+                    self.editor = None;
                     return;
                 }
-                let Some(name) = key_name(key) else { continue };
-                let mut parts = Vec::new();
-                if self.capture_meta {
-                    parts.push("Meta");
+                let (Some(ed), Some(name)) = (self.editor.as_mut(), key_name(key)) else { continue };
+                ed.sc.key = name;
+                ed.sc.ctrl = modifiers.ctrl;
+                ed.sc.alt = modifiers.alt;
+                ed.sc.shift = modifiers.shift;
+            }
+        }
+    }
+
+    /// Feeds KeyTap's events to Record. While it listens egui gets no keys,
+    /// so Space/Return can't press a button and Tab can't move focus.
+    fn record_keys(&mut self, ctx: &egui::Context) {
+        let evs = match &self.keys {
+            Some(q) => q.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default(),
+            None => return,
+        };
+        let Some(ed) = self.editor.as_mut() else { return };
+        let Some(rec) = ed.rec.as_mut() else { return };
+        ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Key { .. } | egui::Event::Text(_))));
+        for ev in evs {
+            match rec.feed(ev) {
+                Rec::Going => {}
+                Rec::Done(sc) => {
+                    ed.sc = sc;
+                    ed.rec = None;
+                    return;
                 }
-                if modifiers.ctrl {
-                    parts.push("Ctrl");
+                Rec::Cancel => {
+                    ed.rec = None;
+                    return;
                 }
-                if modifiers.alt {
-                    parts.push("Alt");
-                }
-                if modifiers.shift {
-                    parts.push("Shift");
-                }
-                parts.push(&name);
-                self.vals.insert(format!("bind.{field}"), parts.join("+"));
-                self.capture = None;
-                return;
             }
         }
     }
 
     fn self_shot(&mut self, ctx: &egui::Context) {
+        // Wait for the monitor list (or ~300 frames) so the Source row is final.
+        let ready = self.monitors.is_some();
         let Some((path, frames)) = &mut self.shot else { return };
-        *frames += 1;
-        if *frames == 5 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+        if *frames < SHOT_SENT {
+            *frames += 1;
+            if *frames >= 5 && (ready || *frames >= 300) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+                *frames = SHOT_SENT;
+            }
         }
         ctx.request_repaint();
         let image = ctx.input(|i| {
@@ -566,6 +870,74 @@ fn number(ui: &mut egui::Ui, key: &str, v: &mut String, range: std::ops::RangeIn
     raw_note(ui, key, v);
 }
 
+/// One monitor from `clipped monitors` (NAME|WxH[|active]).
+#[derive(Clone, Debug, PartialEq)]
+struct Monitor {
+    name: String,
+    size: String,
+}
+
+fn parse_monitors(out: &[u8]) -> Vec<Monitor> {
+    String::from_utf8_lossy(out)
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.trim().split('|');
+            let name = f.next().filter(|n| !n.is_empty() && !n.contains(char::is_whitespace))?;
+            Some(Monitor { name: name.to_string(), size: f.next().unwrap_or("").to_string() })
+        })
+        .collect()
+}
+
+/// Source choices as (config value, label): auto, each detected monitor,
+/// portal, screen on X11, and the configured value if it is none of those,
+/// so picking nothing never drops it. `monitors` is None while still looking.
+fn source_options(current: &str, monitors: Option<&[Monitor]>, x11: bool) -> Vec<(String, String)> {
+    let mut v = vec![("auto".to_string(), "Monitor you're on (auto)".to_string())];
+    v.extend(monitors.unwrap_or(&[]).iter().map(|m| (m.name.clone(), format!("{}  {}", m.name, m.size).trim_end().to_string())));
+    v.push(("portal".into(), "Pick each time (portal)".into()));
+    if x11 {
+        v.push(("screen".into(), "All monitors (X11 screen)".into()));
+    }
+    if !v.iter().any(|(val, _)| val == current) {
+        let label = match (current.is_empty(), monitors) {
+            (true, _) => "(empty)".to_string(),
+            (false, None) => current.to_string(),
+            (false, Some(_)) => format!("{current} (not detected)"),
+        };
+        v.push((current.to_string(), label));
+    }
+    v
+}
+
+fn source_combo(ui: &mut egui::Ui, v: &mut String, monitors: Option<&[Monitor]>, x11: bool) {
+    let opts = source_options(v, monitors, x11);
+    let shown = opts.iter().find(|(val, _)| val == v).map_or(v.clone(), |o| o.1.clone());
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("video_source").width(220.0).selected_text(shown).show_ui(ui, |ui| {
+            for (val, label) in &opts {
+                ui.selectable_value(v, val.clone(), label);
+            }
+            let hint = match monitors {
+                None => Some("(looking for monitors…)"),
+                Some([]) => Some("(no monitors found)"),
+                Some(_) => None,
+            };
+            if let Some(h) = hint {
+                ui.label(RichText::new(h).weak());
+            }
+        });
+        if monitors.is_some_and(|m| m.is_empty()) {
+            ui.label(RichText::new("no monitors found").weak())
+                .on_hover_text("`clipped monitors` listed none: is gpu-screen-recorder installed?");
+        }
+    });
+}
+
+/// The daemon reads these only at start (the replay buffer keeps its monitor).
+fn needs_daemon_restart(changes: &BTreeMap<String, String>) -> bool {
+    changes.keys().any(|k| DAEMON_KEYS.contains(&k.as_str()))
+}
+
 fn text_with_menu(ui: &mut egui::Ui, v: &mut String, width: f32, options: &[String]) {
     ui.add(egui::TextEdit::singleline(v).desired_width(width));
     ui.menu_button("⏷", |ui| {
@@ -587,7 +959,7 @@ fn section(ui: &mut egui::Ui, title: &str) {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages();
-        self.capture_keys(ctx);
+        self.edit_keys(ctx);
         self.self_shot(ctx);
         let red = Color32::from_rgb(0xe0, 0x50, 0x50);
 
@@ -668,9 +1040,9 @@ impl eframe::App for App {
                     });
                     ui.end_row();
                     ui.label("Source");
-                    let mut opts: Vec<String> = ["auto", "portal", "screen"].map(String::from).to_vec();
-                    opts.extend(self.monitors.iter().cloned());
-                    text_with_menu(ui, self.val("video_source"), 180.0, &opts);
+                    let x11 = std::env::var("XDG_SESSION_TYPE").is_ok_and(|s| s == "x11");
+                    let monitors = self.monitors.clone();
+                    source_combo(ui, self.val("video_source"), monitors.as_deref(), x11);
                     ui.end_row();
                     ui.label("Frame rate");
                     ui.horizontal(|ui| number(ui, "video_fps", self.val("video_fps"), 1..=240, 60, " fps"));
@@ -691,18 +1063,17 @@ impl eframe::App for App {
 
                 section(ui, "Shortcuts");
                 egui::Grid::new("binds").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                    let names = ["Region", "Window", "Monitor", "All monitors", "Save replay", "Record"];
-                    for (a, name) in ACTIONS.iter().zip(names) {
+                    for (a, name) in ACTIONS.iter().zip(ACTION_NAMES) {
                         let key = format!("bind.{a}");
                         ui.label(name);
                         ui.horizontal(|ui| {
                             let v = self.vals.entry(key.clone()).or_default();
                             ui.add(egui::TextEdit::singleline(v).desired_width(150.0).hint_text("none"));
-                            let recording = self.capture == Some(*a);
-                            let label = if recording { "Press keys…" } else { "Record" };
-                            let r = ui.add(egui::Button::new(label).selected(recording));
+                            let open = self.editor.as_ref().is_some_and(|e| e.field == *a);
+                            let label = if v.is_empty() { "Set…" } else { "Change" };
+                            let r = ui.add(egui::Button::new(label).selected(open));
                             if r.clicked() {
-                                self.capture = if recording { None } else { Some(*a) };
+                                self.editor = (!open).then(|| Editor { field: a, sc: Shortcut::parse(v), rec: None });
                                 r.surrender_focus();
                             }
                             if ui.button("Clear").clicked() {
@@ -716,17 +1087,99 @@ impl eframe::App for App {
                         ui.end_row();
                     }
                 });
-                if self.capture.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Press the key with Ctrl/Alt/Shift; Esc cancels.").weak());
-                        ui.checkbox(&mut self.capture_meta, "add Meta");
+                let can_record = self.keys.is_some();
+                if let Some(ed) = self.editor.as_mut() {
+                    let (mut set, mut close) = (None, false);
+                    ui.add_space(4.0);
+                    ui.group(|ui| {
+                        let name = ACTIONS.iter().zip(ACTION_NAMES).find(|(a, _)| **a == ed.field).map_or("", |p| p.1);
+                        ui.label(RichText::new(format!("Shortcut for {name}")).strong());
+                        ui.horizontal(|ui| match &ed.rec {
+                            Some(rec) => {
+                                let so_far = rec.shortcut().text();
+                                let shown = if rec.combo.is_empty() { "Press up to 3 keys…".to_string() } else { so_far };
+                                ui.spinner();
+                                ui.label(RichText::new(shown).monospace().strong());
+                                let refused = rec.refused;
+                                let got = (!rec.combo.is_empty()).then(|| rec.shortcut());
+                                if ui.button("Stop").clicked() {
+                                    ed.sc = got.unwrap_or(std::mem::take(&mut ed.sc));
+                                    ed.rec = None;
+                                }
+                                if refused {
+                                    ui.colored_label(red, "that key can't be a shortcut");
+                                }
+                            }
+                            None => {
+                                let r = ui
+                                    .add_enabled(can_record, egui::Button::new("⏺ Record"))
+                                    .on_hover_text("Press the shortcut on the keyboard")
+                                    .on_disabled_hover_text("Key capture isn't available here; use the boxes below");
+                                if r.clicked() {
+                                    ed.rec = Some(Recorder::default());
+                                    r.surrender_focus();
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut ed.sc.meta, "Meta");
+                            ui.checkbox(&mut ed.sc.ctrl, "Ctrl");
+                            ui.checkbox(&mut ed.sc.alt, "Alt");
+                            ui.checkbox(&mut ed.sc.shift, "Shift");
+                            ui.label("+");
+                            let shown = if ed.sc.key.is_empty() { "key…" } else { ed.sc.key.as_str() };
+                            egui::ComboBox::from_id_salt("shortcut-key").selected_text(shown.to_string()).show_ui(ui, |ui| {
+                                for k in key_choices() {
+                                    ui.selectable_value(&mut ed.sc.key, k.clone(), k);
+                                }
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            let text = ed.sc.text();
+                            if ed.sc.key.is_empty() {
+                                ui.label(RichText::new("Pick a key").weak());
+                            } else {
+                                ui.label(RichText::new(&text).monospace().strong());
+                            }
+                            if ui.add_enabled(!ed.sc.key.is_empty(), egui::Button::new("Set")).clicked() {
+                                set = Some(text);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                close = true;
+                            }
+                        });
+                        ui.label(
+                            RichText::new(
+                                "Record takes up to 3 keys and stops when you let go (Stop ends it sooner; Esc \
+                                 cancels). Combos KDE already uses, like the current Meta+Print, go to KDE \
+                                 first: press Stop and pick the key above. 4-key shortcuts: use the boxes.",
+                            )
+                            .small()
+                            .weak(),
+                        );
                     });
+                    if let Some(v) = set {
+                        self.vals.insert(format!("bind.{}", ed.field), v);
+                        close = true;
+                    }
+                    if close {
+                        self.editor = None;
+                    }
                 }
                 ui.label(
                     RichText::new("Meta, Ctrl, Alt, Shift + one key (A–Z, 0–9, F1–F35, Print, Space, Home…).")
                         .small()
                         .weak(),
                 );
+                if self.shortcuts_inactive() {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(red, "Shortcuts are not active.");
+                        if ui.button("Turn on shortcuts").clicked() {
+                            self.set_status(UPDATING.into(), false);
+                            self.rebind();
+                        }
+                    });
+                }
 
                 section(ui, "Tray");
                 ui.checkbox(&mut self.autostart, "Start tray at login");
@@ -759,6 +1212,152 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_parse_and_text() {
+        let sc = |m, c, a, s, k: &str| Shortcut { meta: m, ctrl: c, alt: a, shift: s, key: k.into() };
+        assert_eq!(Shortcut::parse("Meta+Print"), sc(true, false, false, false, "Print"));
+        assert_eq!(Shortcut::parse("super+print").text(), "Meta+Print");
+        assert_eq!(Shortcut::parse("WIN + pageup").text(), "Meta+PgUp");
+        assert_eq!(Shortcut::parse("shift+CONTROL+alt+escape").text(), "Ctrl+Alt+Shift+Esc");
+        assert_eq!(Shortcut::parse("Meta+Alt+r"), sc(true, false, true, false, "R"));
+        assert_eq!(Shortcut::parse("Ctrl+f30").text(), "Ctrl+F30");
+        // Empty field: Meta on, no key yet.
+        assert_eq!(Shortcut::parse(""), sc(true, false, false, false, ""));
+        assert_eq!(Shortcut::parse("  ").text(), "Meta");
+        // Unknown or second keys are dropped; modifiers are kept.
+        assert_eq!(Shortcut::parse("Meta+Nope"), sc(true, false, false, false, ""));
+        assert_eq!(Shortcut::parse("Alt+A+B").text(), "Alt+A");
+        assert_eq!(sc(false, false, false, false, "Print").text(), "Print");
+    }
+
+    /// Every key the editor offers is one clipped accepts, Print first.
+    #[test]
+    fn key_choices_match_clipped() {
+        let keys = key_choices();
+        assert_eq!(keys[0], "Print");
+        assert!(keys.contains(&"F24".into()) && keys.contains(&"Z".into()) && keys.contains(&"9".into()));
+        for k in &keys {
+            assert!(config::valid_shortcut(&format!("Meta+{k}")), "{k}");
+            assert_eq!(canonical_key(&k.to_ascii_lowercase()).as_deref(), Some(k.as_str()));
+        }
+        // Keys egui reports land on an entry of the list.
+        for k in [egui::Key::Escape, egui::Key::Enter, egui::Key::Insert, egui::Key::PageDown, egui::Key::F12, egui::Key::Num0] {
+            assert!(keys.contains(&key_name(k).unwrap()), "{k:?}");
+        }
+    }
+
+    /// Feeds events to a fresh Recorder; the text it ends with ("-" if it
+    /// cancelled, "…+" prefix if still going) and the Recorder.
+    fn record(evs: &[KeyEv]) -> (String, Recorder) {
+        let mut r = Recorder::default();
+        for ev in evs {
+            match r.feed(ev.clone()) {
+                Rec::Going => {}
+                Rec::Done(sc) => return (sc.text(), r),
+                Rec::Cancel => return ("-".into(), r),
+            }
+        }
+        (format!("…{}", r.shortcut().text()), r)
+    }
+
+    /// The combos Record finishes on (each also checked by `clipped check`
+    /// in record_output_passes_clipped_check).
+    fn recorded_combos() -> Vec<(Vec<KeyEv>, &'static str)> {
+        use KeyEv::{Down, Up};
+        use Part::*;
+        let k = |s: &str| Key(s.into());
+        vec![
+            // Meta+Print: two keys, ends when Print goes up.
+            (vec![Down(Meta), Down(k("Print")), Up(k("Print"))], "Meta+Print"),
+            // Ends at 3 held keys, before anything is released.
+            (vec![Down(Ctrl), Down(Alt), Down(k("R"))], "Ctrl+Alt+R"),
+            // A single key.
+            (vec![Down(k("Print")), Up(k("Print"))], "Print"),
+            // Order is always Meta+Ctrl+Alt+Shift+Key, whatever was pressed first.
+            (vec![Down(Shift), Down(k("F12")), Down(Meta)], "Meta+Shift+F12"),
+            (vec![Down(Alt), Down(Ctrl), Up(Alt)], "…Ctrl+Alt"),
+            // Letting go of a modifier first also ends it.
+            (vec![Down(Alt), Down(k("S")), Up(Alt)], "Alt+S"),
+            // A second key replaces the first (clipped takes one).
+            (vec![Down(Ctrl), Down(k("A")), Down(k("B")), Up(k("B"))], "Ctrl+B"),
+            // Esc with a modifier is a shortcut; alone it cancels.
+            (vec![Down(Ctrl), Down(k("Esc")), Up(k("Esc"))], "Ctrl+Esc"),
+            (vec![Down(k("Esc"))], "-"),
+        ]
+    }
+
+    #[test]
+    fn record_capture_rules() {
+        use KeyEv::{Down, Other, Reset, Up};
+        use Part::*;
+        for (evs, want) in recorded_combos() {
+            assert_eq!(record(&evs).0, want, "{evs:?}");
+        }
+        // Max 3 keys: three modifiers end it with no key (pick one from the list).
+        let (text, _) = record(&[Down(Meta), Down(Ctrl), Down(Alt), Down(Key("R".into()))]);
+        assert_eq!(text, "Meta+Ctrl+Alt");
+        // Modifiers alone, let go: still listening, shown for Stop.
+        let (text, r) = record(&[Down(Meta), Up(Meta)]);
+        assert_eq!(text, "…Meta");
+        assert_eq!(r.shortcut(), Shortcut { meta: true, ..Default::default() });
+        // …and the next press starts over (no stale Meta).
+        assert_eq!(record(&[Down(Meta), Up(Meta), Down(Ctrl), Down(Key("R".into())), Up(Key("R".into()))]).0, "Ctrl+R");
+        // Keys already down when Record started: their release is ignored.
+        assert_eq!(record(&[Up(Key("Space".into())), Up(Ctrl), Down(Meta)]).0, "…Meta");
+        // A held key repeating (winit repeats are dropped, but be safe).
+        assert_eq!(record(&[Down(Meta), Down(Meta), Down(Key("V".into())), Up(Key("V".into()))]).0, "Meta+V");
+        // Focus lost: held keys are forgotten, the next press starts over.
+        assert_eq!(record(&[Down(Meta), Reset, Down(Key("P".into())), Up(Key("P".into()))]).0, "P");
+        // A key clipped can't bind is flagged and not taken.
+        let (text, r) = record(&[Down(Ctrl), Other]);
+        assert_eq!(text, "…Ctrl");
+        assert!(r.refused);
+        assert!(!record(&[Down(Ctrl), Other, Up(Ctrl), Down(Alt)]).1.refused);
+    }
+
+    #[test]
+    fn winit_keys_map_to_clipped_names() {
+        use winit::keyboard::{Key, NamedKey as N};
+        let name = |k: Key| match winit_part(&k) {
+            Some(Part::Key(s)) => s,
+            Some(p) => format!("{p:?}"),
+            None => "-".into(),
+        };
+        for (k, want) in [
+            (N::Super, "Meta"), (N::Meta, "Meta"), (N::Control, "Ctrl"), (N::Alt, "Alt"), (N::Shift, "Shift"),
+            (N::PrintScreen, "Print"), (N::Pause, "Pause"), (N::Escape, "Esc"), (N::Enter, "Return"),
+            (N::Insert, "Ins"), (N::Delete, "Del"), (N::PageUp, "PgUp"), (N::PageDown, "PgDown"),
+            (N::ArrowLeft, "Left"), (N::ArrowDown, "Down"), (N::Space, "Space"), (N::Tab, "Tab"),
+            (N::Backspace, "Backspace"), (N::F1, "F1"), (N::F24, "F24"), (N::F35, "F35"),
+            (N::AltGraph, "-"), (N::CapsLock, "-"), (N::AudioVolumeUp, "-"),
+        ] {
+            assert_eq!(name(Key::Named(k)), want, "{k:?}");
+        }
+        for (c, want) in [("r", "R"), ("R", "R"), ("7", "7"), (",", "-"), ("é", "-"), ("ab", "-")] {
+            assert_eq!(name(Key::Character(c.into())), want, "{c}");
+        }
+    }
+
+    /// Everything Record can finish with is a value `clipped check` accepts.
+    #[test]
+    fn record_output_passes_clipped_check() {
+        let Some(clipped) = clip_script() else { return };
+        let _env = crate::testutil::env_lock();
+        let d = crate::testutil::tempdir("rec");
+        test_env(&d, &clipped);
+        let cfg = d.join("config");
+        for (evs, want) in recorded_combos() {
+            if want.starts_with(['-', '…']) {
+                continue;
+            }
+            let text = record(&evs).0;
+            assert!(config::valid_shortcut(&text), "{text}");
+            std::fs::write(&cfg, format!("bind.region = {text}\n")).unwrap();
+            let o = run_clip(&["check"], Some(&cfg)).unwrap();
+            assert!(o.status.success(), "{text}: {}", stderr_of(&o));
+        }
+    }
+
+    #[test]
     fn autostart_entry_validates() {
         let d = crate::testutil::tempdir("auto");
         let f = d.join("clipped-gui.desktop");
@@ -769,6 +1368,42 @@ mod tests {
         if let Ok(o) = Command::new("desktop-file-validate").arg(&f).output() {
             assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
         }
+    }
+
+    #[test]
+    fn monitors_parse() {
+        let m = parse_monitors(b"DP-1|2560x1440\nDP-2|1920x1080|active\n\nbad line\n|1x1\nHDMI-A-1\n");
+        let names: Vec<_> = m.iter().map(|m| (m.name.as_str(), m.size.as_str())).collect();
+        assert_eq!(names, [("DP-1", "2560x1440"), ("DP-2", "1920x1080"), ("HDMI-A-1", "")]);
+    }
+
+    #[test]
+    fn source_choices() {
+        let m = parse_monitors(b"DP-1|2560x1440\nDP-2|2560x1440|active\n");
+        let vals = |cur: &str, x11| source_options(cur, Some(&m), x11).into_iter().map(|o| o.0).collect::<Vec<_>>();
+        assert_eq!(vals("auto", false), ["auto", "DP-1", "DP-2", "portal"]);
+        assert_eq!(vals("DP-2", false), ["auto", "DP-1", "DP-2", "portal"]);
+        assert_eq!(vals("auto", true), ["auto", "DP-1", "DP-2", "portal", "screen"]);
+        // Unknown values stay selectable, never dropped or duplicated.
+        assert_eq!(vals("DP-9", false), ["auto", "DP-1", "DP-2", "portal", "DP-9"]);
+        assert_eq!(vals("screen", false), ["auto", "DP-1", "DP-2", "portal", "screen"]);
+        assert_eq!(vals("screen", true), ["auto", "DP-1", "DP-2", "portal", "screen"]);
+        let o = source_options("DP-9", Some(&m), false);
+        assert_eq!(o[0].1, "Monitor you're on (auto)");
+        assert_eq!(o[1].1, "DP-1  2560x1440");
+        assert_eq!(o[3].1, "Pick each time (portal)");
+        assert_eq!(o[4].1, "DP-9 (not detected)");
+        assert_eq!(source_options("DP-9", None, false)[2].1, "DP-9");
+        assert_eq!(source_options("", Some(&[]), false).into_iter().map(|o| o.0).collect::<Vec<_>>(), ["auto", "portal", ""]);
+    }
+
+    #[test]
+    fn video_source_change_offers_restart() {
+        let ch = |k: &str| BTreeMap::from([(k.to_string(), "x".to_string())]);
+        assert!(needs_daemon_restart(&ch("video_source")));
+        assert!(needs_daemon_restart(&ch("replay_seconds")));
+        assert!(!needs_daemon_restart(&ch("image_format")));
+        assert!(!needs_daemon_restart(&ch("bind.region")));
     }
 
     fn clip_script() -> Option<PathBuf> {
@@ -803,6 +1438,8 @@ mod tests {
         app
     }
 
+    /// Also called before a test ends: a bind thread outliving env_lock
+    /// would run under the next test's CLIPPED_BIN.
     fn wait_rebind(app: &mut App) {
         for _ in 0..200 {
             app.poll_messages();
@@ -872,6 +1509,7 @@ mod tests {
         assert_eq!(after, b"# caf\xe9\r\nvideo_fps = 30   # \xe9\nimage_format = jpg\n");
         assert!(load_status.is_empty() && fps == "30", "{load_status}");
         assert!(!app.error, "{}", app.status);
+        wait_rebind(&mut app);
     }
 
     /// The Save button end to end, headless, in temp XDG dirs.
@@ -884,14 +1522,16 @@ mod tests {
         let mut app = app_at(&d.join("cfg/clipped/config"));
         assert!(app.status.contains("No config file yet"));
 
-        // New file: clipped's template plus the changes; binds wait for clipped.
+        // New file: clipped's template plus the changes, then `clipped bind`.
         // Text fields are trimmed.
         app.vals.insert("image_format".into(), "jpg".into());
         app.vals.insert("bind.window".into(), String::new());
         app.vals.insert("video_source".into(), "  DP-1 ".into());
         app.save();
         assert!(!app.error, "{}", app.status);
-        assert!(app.status.contains("Shortcuts apply when clipped starts"), "{}", app.status);
+        assert!(app.status.contains(UPDATING), "{}", app.status);
+        wait_rebind(&mut app);
+        assert!(app.status.starts_with("Saved. Shortcuts updated"), "{}", app.status);
         let text = std::fs::read_to_string(&app.path).unwrap();
         assert!(text.starts_with("# clipped config"), "{text}");
         assert!(text.contains("\nimage_format = jpg         # png | jpg | webp\n"), "{text}");
@@ -920,11 +1560,43 @@ mod tests {
         app.load();
         app.autostart = true;
         app.save();
+        wait_rebind(&mut app);
         let auto = d.join("cfg/autostart/clipped-gui.desktop");
         assert!(std::fs::read_to_string(&auto).unwrap().contains("X-GNOME-Autostart-enabled=true"));
         app.autostart = false;
         app.save();
+        wait_rebind(&mut app);
         assert!(!auto.exists() && !app.error, "{}", app.status);
+    }
+
+    /// Kevin's case: installed, never bound. Any Save runs `clipped bind`;
+    /// once clipped has bound, a Save without bind.* changes doesn't.
+    #[test]
+    fn first_save_binds() {
+        let Some(clipped) = clip_script() else { return };
+        let _env = crate::testutil::env_lock();
+        let d = crate::testutil::tempdir("firstbind");
+        test_env(&d, &clipped);
+        let cfg = d.join("config");
+        std::fs::write(&cfg, "image_format = png\n").unwrap();
+        let mut app = app_at(&cfg);
+        assert!(app.shortcuts_inactive());
+        app.vals.insert("image_format".into(), "jpg".into());
+        assert!(!app.shortcuts_inactive(), "Save binds; no second offer while dirty");
+        app.save();
+        assert!(app.status.starts_with("Saved. Updating shortcuts…") && app.rebinding, "{}", app.status);
+        wait_rebind(&mut app);
+        assert!(!app.error && app.status.starts_with("Saved. Shortcuts updated"), "{}", app.status);
+
+        std::fs::create_dir_all(d.join("state/clipped")).unwrap();
+        std::fs::write(d.join("state/clipped/binds"), "kde region Meta+Print\n").unwrap();
+        assert!(!app.shortcuts_inactive());
+        app.vals.insert("image_format".into(), "webp".into());
+        app.save();
+        assert!(!app.rebinding && app.status == "Saved.", "{}", app.status);
+        let calls = std::fs::read_to_string(d.join("calls")).unwrap();
+        let runs: Vec<&str> = calls.lines().filter(|l| *l != "check" && *l != "config").collect();
+        assert_eq!(runs, ["bind"], "{calls}");
     }
 
     /// A value clipped refuses is shown as the file has it (not as the
@@ -947,6 +1619,7 @@ mod tests {
         app.vals.insert("notify".into(), "false".into());
         app.save();
         assert!(!app.error, "{}", app.status);
+        wait_rebind(&mut app);
         assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "video_fps = 30\nnotify = false\nimage_format = jpg\n");
     }
 
@@ -1001,6 +1674,7 @@ mod tests {
         app.vals.insert("video_fps".into(), "30".into());
         app.save();
         assert!(!app.error, "{}", app.status);
+        wait_rebind(&mut app);
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "link was replaced");
         let target = std::fs::read_to_string(d.join("dots/clipped.conf")).unwrap();
         assert!(target.starts_with("# clipped config") && target.contains("\nvideo_fps = 30 "), "{target}");

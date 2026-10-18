@@ -14,7 +14,8 @@ trap 'pkill -KILL -f "$T/fake/gpu-screen-recorder" 2>/dev/null; rm -rf "$T"' EXI
 mkdir -p "$T/run" "$T/fake" "$T/fakesleep"
 export CLIPPED_CONFIG="$T/config" XDG_RUNTIME_DIR="$T/run" XDG_DATA_HOME="$T/data" \
        XDG_CONFIG_HOME="$T/cfg" XDG_STATE_HOME="$T/state" XDG_CACHE_HOME="$T/cache" \
-       TMPDIR="$T" CLIPPED_DRY_RUN=1 XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=KDE
+       TMPDIR="$T" CLIPPED_DRY_RUN=1 XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=KDE \
+       CLIPPED_GUI="$T/fake/clipped-gui"
 unset HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK
 export PATH="$T/fake:$PATH" CLIPPED T
 fail=0 n=0
@@ -25,7 +26,13 @@ cat >"$T/fake/gpu-screen-recorder" <<'EOF'
 # Fake recorder: writes -o FILE on INT/TERM. FAKE_GSR=stubborn ignores both.
 import os, signal, sys, time
 a = sys.argv[1:]
-if a and a[0] in ("--info", "--list-monitors"):
+if a and a[0] == "--list-monitors":
+    # FAKE_MONITORS: what to print, ";" between lines.
+    m = os.environ.get("FAKE_MONITORS", "")
+    if m:
+        print(m.replace(";", "\n"))
+    sys.exit(0)
+if a and a[0] == "--info":
     sys.exit(0)
 out = a[a.index("-o") + 1] if "-o" in a else ""
 def done(*_):
@@ -60,6 +67,25 @@ cat >"$T/fake/swaymsg" <<'EOF'
 exit 0
 EOF
 printf '#!/bin/sh\nexit 0\n' >"$T/fake/gnome-screenshot"
+cat >"$T/fake/clipped-gui" <<'EOF'
+#!/bin/sh
+# Fake KWin grab: logs its args, writes "png" to the last one.
+# FAKE_GUI=fail answers like an unauthorized clipped-gui.
+echo "$*" >>"$T/gui.log"
+[ "$FAKE_GUI" = fail ] && { echo "clipped-gui: not authorized: is clipped.desktop installed" >&2; exit 1; }
+for o; do :; done; echo png >"$o"
+EOF
+# Fake KWin for video_source auto, only on PATH in the checks that want it.
+# FAKE_KWIN: the activeOutputName reply; "fail" exits 1.
+mkdir -p "$T/fakekwin"
+cat >"$T/fakekwin/gdbus" <<'EOF'
+#!/bin/sh
+echo "$*" >>"$T/gdbus.log"
+case "$*" in *org.kde.KWin.activeOutputName*) ;; *) exit 1 ;; esac
+[ "$FAKE_KWIN" = fail ] && exit 1
+printf '%s\n' "${FAKE_KWIN:-('DP-2',)}"
+EOF
+chmod +x "$T/fakekwin/gdbus"
 for t in notify-send wl-copy; do
     printf '#!/bin/sh\n[ "$1" = --help ] && { echo "  -A, --action"; exit 0; }\necho "$0 $*" >>"$T/real-calls.log"\n' >"$T/fake/$t"
 done
@@ -133,22 +159,60 @@ check "keyint Ctrl+Shift+Print" "[ \"\$($(lib qt_keyint Ctrl+Shift+Print))\" = $
 check "xkb names" "[ \"\$($(lib "bind_combo sway Meta+PgUp; bind_combo hypr Alt+backspace; bind_combo gnome Ctrl+Ins"))\" = \$'Mod4+Prior\nALT, BackSpace\n<Ctrl>Insert' ]"
 
 check "replay auto 30|60" "'$CLIPPED' --detect | grep -Eqx 'replay_seconds=(30|60)'"
-check "kde -> spectacle"  "'$CLIPPED' --detect | grep -Eqx 'capture=(spectacle|none)'"
+check "kde wayland -> kwin" "'$CLIPPED' --detect | grep -qx 'capture=kwin'"
+check "kde, no clipped-gui -> not kwin" "CLIPPED_GUI='$T/none' '$CLIPPED' --detect | grep -Eqx 'capture=(spectacle|none)'"
+check "kde x11 -> not kwin" "out=\$(XDG_SESSION_TYPE=x11 '$CLIPPED' --detect) && grep -q '^capture=' <<<\"\$out\" && ! grep -qx 'capture=kwin' <<<\"\$out\""
+t_gui_next() {   # without CLIPPED_GUI: the clipped-gui beside bin/clipped wins
+    mkdir -p "$T/nb" && cp "$T/fake/clipped-gui" "$T/nb/" || return 1
+    [ "$(env -u CLIPPED_GUI bash -c "source '$CLIPPED'; CLIPPED_BIN='$T/nb/clipped'; gui_bin")" = "$T/nb/clipped-gui" ]
+}
+export -f t_gui_next
+check "clipped-gui next to clipped" t_gui_next
 check "codec mp4 prefers av1" "[ \"\$($(lib "pick_codec mp4 \$'h264\nhevc\nav1'"))\" = av1 ]"
 check "codec mp4 h264 only"   "[ \"\$($(lib "pick_codec mp4 h264"))\" = h264 ]"
 check "codec webm vp9"        "[ \"\$($(lib "pick_codec webm \$'h264\nvp9'"))\" = vp9 ]"
 check "uri encodes UTF-8 bytes" "[ \"\$($(lib "file_uri '/h/é Д'"))\" = 'file:///h/%C3%A9%20%D0%94' ]"
 
 # ---- screenshots + toast
-check "region png (kde)"  "out=\$('$CLIPPED' region) && grep -q '^+ spectacle -b -n -r -o $T/clipped\.[A-Za-z0-9]*/shot.png' <<<\"\$out\" && grep -q 'wl-copy --type image/png' <<<\"\$out\" && grep -Eq '/docs/clipped/images/[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}_region.png\$' <<<\"\$out\" && [ -d '$T/docs/clipped/images' ] && ! ls -d '$T'/clipped.* 2>/dev/null"
+mkdir -p "$T/fakeregion"; printf '#!/bin/sh\nexit 1\n' >"$T/fakeregion/slurp"; chmod +x "$T/fakeregion/slurp"  # dry run never calls it
+check "region png (kde)"  "out=\$(PATH=\"$T/fakeregion:\$PATH\" '$CLIPPED' region 2>&1) && grep -q '^+ slurp -b #00000055' <<<\"\$out\" && grep -q '^+ $T/fake/clipped-gui --grab area X Y W H $T/clipped\.[A-Za-z0-9]*/shot.png\$' <<<\"\$out\" && ! grep -qE 'spectacle|crop=' <<<\"\$out\" && grep -q 'wl-copy --type image/png' <<<\"\$out\" && grep -Eq '/docs/clipped/images/[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}_region.png\$' <<<\"\$out\" && [ -d '$T/docs/clipped/images' ] && ! ls -d '$T'/clipped.* 2>/dev/null"
 check "toast kde: x-kde-urls + actions" "out=\$('$CLIPPED' all) && grep -q '^+ notify-send -a clipped -i camera-photo -h string:x-kde-urls:file://$T/docs/clipped/images/.*_all.png -A open=Open -A .folder=Show in folder. .Screenshot saved. ' <<<\"\$out\" && grep -qx 'Copied to clipboard.' <<<\"\$out\""
 check "toast gnome: image-path" "XDG_CURRENT_DESKTOP=GNOME '$CLIPPED' window | grep -q 'notify-send -a clipped -h string:image-path:$T/docs/clipped/images/.*_window.png -A open=Open'"
 conf 'image_format = webp'
-check "window webp"       "out=\$('$CLIPPED' window) && grep -q 'spectacle -b -n -a' <<<\"\$out\" && grep -q 'libwebp' <<<\"\$out\" && grep -q 'image/webp' <<<\"\$out\""
+check "window webp"       "out=\$('$CLIPPED' window) && grep -q 'clipped-gui --grab window ' <<<\"\$out\" && grep -q 'libwebp' <<<\"\$out\" && grep -q 'image/webp' <<<\"\$out\""
 conf 'notify = false' 'clipboard = false'
 check "notify/clipboard off" "out=\$('$CLIPPED' monitor) && ! grep -qE 'notify-send|wl-copy' <<<\"\$out\" && ! grep -q 'Copied' <<<\"\$out\""
 conf
-check "monitor/all flags" "'$CLIPPED' monitor | grep -q 'spectacle -b -n -m' && '$CLIPPED' all | grep -q 'spectacle -b -n -f'"
+check "kwin monitor/all"  "'$CLIPPED' monitor | grep -q '^+ $T/fake/clipped-gui --grab monitor ' && '$CLIPPED' all | grep -q '^+ $T/fake/clipped-gui --grab all '"
+mkdir -p "$T/fakespec"; printf '#!/bin/sh\nexit 1\n' >"$T/fakespec/spectacle"; chmod +x "$T/fakespec/spectacle"
+t_spectacle() {   # no clipped-gui: Spectacle (dry run) is the fallback
+    export PATH="$T/fakespec:$PATH" CLIPPED_GUI="$T/none"
+    "$CLIPPED" --detect | grep -qx capture=spectacle && "$CLIPPED" monitor | grep -q 'spectacle -b -n -m' \
+        && "$CLIPPED" all | grep -q 'spectacle -b -n -f' && "$CLIPPED" window | grep -q 'spectacle -b -n -a' \
+        && "$CLIPPED" region | grep -q 'spectacle -b -n -r'
+}
+export -f t_spectacle
+check "spectacle fallback flags" t_spectacle
+# Real mode, fake clipped-gui/slurp: the png is saved; a failed grab is
+# reported (not "cancelled"); a cancelled selection never calls clipped-gui.
+t_kwin_real() {
+    local out rc; rm -f "$T/gui.log"; export CLIPPED_DRY_RUN=0 PATH="$T/fakekwin:$PATH"
+    mkdir -p "$T/fakekwin"
+    printf '#!/bin/sh\necho "${FAKE_SLURP:-10 20 30 40}"; [ -z "$FAKE_SLURP" ]\n' >"$T/fakekwin/slurp"
+    chmod +x "$T/fakekwin/slurp"
+    out=$("$CLIPPED" region 2>&1) || { echo "$out"; return 1; }
+    [[ "$out" == "$T"/docs/clipped/images/*_region.png && "$(cat "$out")" == png ]] || { echo "$out"; return 1; }
+    grep -Eqx -- "--grab area 10 20 30 40 $T/clipped\.[A-Za-z0-9]+/shot\.png" "$T/gui.log" || { cat "$T/gui.log"; return 1; }
+    out=$(FAKE_GUI=fail "$CLIPPED" all 2>&1); rc=$?
+    [ $rc = 1 ] && [ "$out" = "clipped: screenshot failed: not authorized: is clipped.desktop installed" ] || { echo "rc=$rc $out"; return 1; }
+    rm -f "$T/gui.log"; out=$(FAKE_SLURP=" " "$CLIPPED" region 2>&1); rc=$?
+    [ $rc = 1 ] && [ "$out" = "clipped: cancelled" ] && [ ! -e "$T/gui.log" ] || { echo "rc=$rc $out"; return 1; }
+    [ "$(ls "$T/docs/clipped/images" | wc -l)" = 1 ] && ! ls -d "$T"/clipped.* 2>/dev/null
+}
+export -f t_kwin_real
+realconf
+check "kwin real mode (fake gui): save, fail, cancel" t_kwin_real
+conf
 if command -v grim >/dev/null; then
     check "hyprland grim"  "XDG_CURRENT_DESKTOP=Hyprland '$CLIPPED' window | grep -q '^+ grim -g ' && XDG_CURRENT_DESKTOP=sway '$CLIPPED' monitor | grep -q '^+ grim -o '"
 fi
@@ -156,6 +220,18 @@ fi
 # ---- video
 conf 'video_source = DP-9' 'video_codec = hevc' 'video_format = mkv' 'audio = none'
 check "record cmd"        "out=\$('$CLIPPED' record) && grep -q '^+ gpu-screen-recorder -w DP-9 -c mkv -k hevc -f 60 -q very_high -sc ' <<<\"\$out\" && ! grep -q -- ' -a ' <<<\"\$out\" && grep -Eq '_record.mkv\$' <<<\"\$out\""
+# auto source: the monitor KWin calls active, if gpu-screen-recorder lists it
+K="PATH='$T/fakekwin:$PATH' FAKE_MONITORS='DP-1|2560x1440;DP-2|2560x1440'"
+conf 'video_source = auto' 'video_codec = hevc' 'audio = none'
+check "auto source = KWin active output" "out=\$($K '$CLIPPED' --detect) && grep -qx video_source=DP-2 <<<\"\$out\" && grep -q -- '--timeout 2 -d org.kde.KWin -o /KWin -m org.kde.KWin.activeOutputName' '$T/gdbus.log'"
+check "auto record follows the active monitor" "$K FAKE_KWIN=\"('DP-1',)\" '$CLIPPED' record | grep -q '^+ gpu-screen-recorder -w DP-1 ' && $K '$CLIPPED' record | grep -q '^+ gpu-screen-recorder -w DP-2 '"
+check "auto: unlisted/garbage/failed KWin = first monitor" "for k in \"('HDMI-9',)\" \"('DP-2'); rm -rf ~\" DP-2 fail; do out=\$($K FAKE_KWIN=\"\$k\" '$CLIPPED' --detect) && grep -qx video_source=DP-1 <<<\"\$out\" || exit 1; done"
+check "auto: no monitors listed = screen" "PATH='$T/fakekwin:$PATH' '$CLIPPED' --detect | grep -qx video_source=screen"
+check "auto: KWin not asked off KDE" "rm -f '$T/gdbus.log'; out=\$(XDG_CURRENT_DESKTOP=GNOME $K '$CLIPPED' --detect) && grep -qx video_source=DP-1 <<<\"\$out\" && [ ! -e '$T/gdbus.log' ]"
+printf 'video_source = auto\nimage_format = bmp\n' >"$CLIPPED_CONFIG"
+check "monitors: list, active marked, any config" "out=\$($K '$CLIPPED' monitors) && [ \"\$out\" = \"\$(printf 'DP-1|2560x1440\nDP-2|2560x1440|active')\" ] && [ -z \"\$(PATH='$T/fakekwin:$PATH' '$CLIPPED' monitors)\" ]"
+check "monitors: no gpu-screen-recorder = error" "out=\$($(lib 'have() { [ "$1" != gpu-screen-recorder ]; }; main monitors') 2>&1); [ \$? -eq 1 ] && grep -q 'gpu-screen-recorder is not installed' <<<\"\$out\""
+conf 'video_source = DP-9' 'video_codec = hevc' 'video_format = mkv' 'audio = none'
 check "ffmpeg webm = vp9 + opus" "out=\$($(lib 'CFG[video_format]=webm; ffmpeg_args /v.webm | paste -sd" "')) && grep -q -- '-c:v libvpx-vp9 -crf 32 -b:v 0 ' <<<\"\$out\" && grep -q -- '-c:a libopus' <<<\"\$out\" && ! grep -q x264 <<<\"\$out\""
 check "ffmpeg mp4 = x264 + aac" "out=\$($(lib 'ffmpeg_args /v.mp4 | paste -sd" "')) && grep -q -- '-c:v libx264 ' <<<\"\$out\" && grep -q -- '-c:a aac' <<<\"\$out\" && grep -q ' /v.mp4\$' <<<\"\$out\""
 check "toast video: thumb + titles" "out=\$('$CLIPPED' _saved /x/Replay_1.mp4 replay 2>&1) && grep -q 'ffmpeg -loglevel error -y -ss 1 -i $T/docs/clipped/videos/.*_replay.mp4 -frames:v 1 -vf scale=512:-2 $T/cache/clipped/thumbs/' <<<\"\$out\" && grep -q 'x-kde-urls:file://.*_replay.mp4 -h string:image-path:$T/cache/clipped/thumbs/.*_replay.png .*Clip saved (' <<<\"\$out\" && '$CLIPPED' _saved /x/r.webm | grep -q \"'Recording saved'\""
@@ -220,7 +296,7 @@ check "rundir: fallback is 700" "out=\$(env -u XDG_RUNTIME_DIR TMPDIR='$T/tp2' b
 # ---- binds
 conf 'replay_seconds = 20' 'bind.window ='
 mkdir -p "$T/state/clipped"; echo 'kde window Meta+Alt+W' >"$T/state/clipped/binds"
-check "daemon: kde binds + replay" "out=\$('$CLIPPED' daemon) && grep -q 'setShortcut .\[\"clipped-region.desktop\",\"_launch\",\"clipped region\",\"clipped region\"\]. .\[402653266\]. 4' <<<\"\$out\" && grep -q 'rm -f .*clipped-window.desktop' <<<\"\$out\" && grep -q 'save $T/state/clipped/binds: kde region Meta+Alt+R monitor' <<<\"\$out\" && grep -q -- '-r 20 -replay-storage ram -o $T/docs/clipped/videos' <<<\"\$out\" && [ ! -e '$T/data/applications/clipped-region.desktop' ]"
+check "daemon: kde binds + replay" "out=\$('$CLIPPED' daemon) && grep -q 'setShortcut .\[\"clipped-region.desktop\",\"_launch\",\"clipped region\",\"clipped region\"\]. .\[402653266\]. 6' <<<\"\$out\" && grep -q 'rm -f .*clipped-window.desktop' <<<\"\$out\" && grep -q 'save $T/state/clipped/binds: kde region Meta+Alt+R monitor' <<<\"\$out\" && grep -q -- '-r 20 -replay-storage ram -o $T/docs/clipped/videos' <<<\"\$out\" && [ ! -e '$T/data/applications/clipped-region.desktop' ]"
 printf '%s\n' 'kde window Meta+Alt+W' 'kde all Meta+Alt+A' 'hyprland region Meta+Shift+R' >"$T/state/clipped/binds"
 check "unbind kde from state" "out=\$('$CLIPPED' unbind) && [ \$(grep -c 'KGlobalAccel.unregister' <<<\"\$out\") = 2 ] && grep -q 'clipped-all.desktop' <<<\"\$out\" && ! grep -q 'clipped-region' <<<\"\$out\""
 check "unbind hyprland from state" "out=\$(XDG_CURRENT_DESKTOP=Hyprland '$CLIPPED' unbind) && grep -qF \"hyprctl keyword unbind 'SUPER SHIFT, r'\" <<<\"\$out\" && ! grep -q 'ALT, r' <<<\"\$out\""
@@ -300,6 +376,7 @@ t_install() {   # into a temp DESTDIR; uninstall removes exactly the manifest
     [ "$(wc -l <"$d/usr/local/share/clipped/installed")" = 12 ] || return 1
     grep -qx 'Exec=/usr/local/bin/clipped-gui --open' "$d/usr/local/share/applications/clipped.desktop" || return 1
     grep -qx 'Categories=Utility;' "$d/usr/local/share/applications/clipped.desktop" || return 1
+    grep -qx 'X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2' "$d/usr/local/share/applications/clipped.desktop" || return 1
     if command -v desktop-file-validate >/dev/null; then
         out=$(desktop-file-validate "$d/usr/local/share/applications/clipped.desktop") && [ -z "$out" ] || { echo "$out"; return 1; }
     fi

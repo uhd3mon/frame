@@ -43,6 +43,9 @@ desktop_arg() {
     echo "${s//%/"%%"}"
 }
 
+# KWin lets clipped-gui (--grab) use its ScreenShot2 API only because this
+# entry names it: Exec's first word must be the absolute final path (PREFIX,
+# never DESTDIR) of the running binary.
 desktop_entry() {
     cat <<EOF
 [Desktop Entry]
@@ -56,6 +59,7 @@ Terminal=false
 Categories=Utility;
 Keywords=screenshot;screen;capture;record;recording;replay;video;
 StartupWMClass=clipped
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 EOF
 }
 

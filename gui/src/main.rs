@@ -1,11 +1,15 @@
 //! clipped-gui: tray icon and settings window for clipped. bin/clipped does the
 //! work; this only shows its state, runs its commands and edits its config.
+//! The one exception is --grab: KWin hands screenshots only to a compiled
+//! binary named in a .desktop file, so bin/clipped calls us for that on KDE.
 //!
 //!   clipped-gui             tray (one per session; if it runs, open settings)
 //!   clipped-gui --open      tray if not running, and the settings window
 //!   clipped-gui --settings  the settings window only (one at a time)
+//!   clipped-gui --grab MODE [X Y W H] OUT.png   KDE screenshot (used by clipped)
 
 mod config;
+mod grab;
 mod icons;
 mod settings;
 mod state;
@@ -16,17 +20,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn main() {
-    let arg = std::env::args().nth(1);
-    let code = match arg.as_deref() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let code = match args.first().map(String::as_str) {
         None => run_tray(false),
         Some("--open") => run_tray(true),
         Some("--settings") => run_settings(),
+        Some("--grab") => grab::main(&args[1..]),
         Some("--version") => {
             println!("clipped-gui {}", env!("CARGO_PKG_VERSION"));
             0
         }
         Some("-h" | "--help") => {
-            println!("Usage: clipped-gui [--open | --settings | --version]");
+            println!("Usage: clipped-gui [--open | --settings | --version | --grab MODE [X Y W H] OUT.png]");
             0
         }
         Some(a) => {

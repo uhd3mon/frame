@@ -345,6 +345,8 @@ dependencies = [
  "libc",
  "png",
  "rfd",
+ "winit",
+ "zbus",
 ]
 
 [[package]]

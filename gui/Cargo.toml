@@ -16,6 +16,12 @@ ksni = { version = "=0.3.6", default-features = false, features = ["tokio", "blo
 png = "0.18"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 libc = "0.2"
+# Already in the tree via eframe (same version, its features): Record taps
+# winit's key events, where Meta and Print still exist (egui drops them).
+winit = { version = "=0.30.13", default-features = false }
+# Already in the tree via ksni/ashpd (same version, tokio): --grab calls
+# KWin's ScreenShot2 with the blocking API (no new crates).
+zbus = { version = "=5.15.0", default-features = false, features = ["tokio", "blocking-api"] }
 
 [profile.release]
 opt-level = "s"

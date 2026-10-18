@@ -21,8 +21,14 @@ window on top of it.
   other projects.
 - Plain Bash, one script (`bin/clipped`). Call existing tools. The only
   compiled part is `gui/` (Kevin asked for it, 2026-10-17): eframe/egui
-  (glow) window, ksni tray, png, rfd. The GUI never does clipped's work: it
-  runs `clipped …`, reads clipped's pid files and edits the config. Keep its
+  (glow) window, ksni tray, png, rfd, zbus. The GUI never does clipped's
+  work: it runs `clipped …`, reads clipped's pid files and edits the
+  config. One exception: `clipped-gui --grab` (`gui/src/grab.rs`) takes
+  KDE Wayland screenshots through KWin's ScreenShot2 D-Bus API, because
+  KWin only authorizes a compiled binary named by a .desktop entry with
+  `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2` (Kevin wants
+  no Spectacle, 2026-10-17). Never authorize a shell tool (gdbus, python,
+  busctl) that way: any script could then take screenshots. Keep its
   deps lean; don't add a second binary.
 - The GUI's config reader must follow bash `load_config` exactly, and
   its writer must only change edited values (comments, order, unknown
@@ -31,8 +37,9 @@ window on top of it.
   `default_config()` (a test checks this).
 - One config file, parsed as `key = value` text. Never `source` or eval it.
 - Pick backends at runtime by desktop/session; never assume Hyprland.
-- grim does **not** work on KWin or Mutter. KDE uses `spectacle -b -n`;
-  GNOME uses gnome-screenshot. Video uses gpu-screen-recorder.
+- grim does **not** work on KWin or Mutter. KDE Wayland uses
+  `clipped-gui --grab` (KWin ScreenShot2; slurp for region), Spectacle
+  only when clipped-gui is missing or on X11; GNOME uses gnome-screenshot. Video uses gpu-screen-recorder.
 - Tests must not take real screenshots or recordings, touch the
   clipboard, send notifications, change real shortcuts or install into
   the real `~/.local` (use `DESTDIR`, or a temp `PREFIX` with a fake
@@ -63,10 +70,10 @@ HANDOFF.md       current state and history
 
 ```sh
 bash -n bin/clipped    # syntax check
-bash tests/smoke.sh    # 95 checks, "95 checks, all passed" (~14 s
+bash tests/smoke.sh    # 107 checks, "107 checks, all passed" (~15 s
                        # once gui/ is built; cargo test is one check)
 bin/clipped --detect   # shows chosen backends and resolved settings
-cd gui && cargo test   # 29 tests, "test result: ok. 29 passed"
+cd gui && cargo test   # 43 tests, "test result: ok. 43 passed"
 cd gui && cargo clippy # no warnings
 cd gui && cargo build --release   # ~35 s clean; 6.6 MB stripped binary
 DESTDIR=/tmp/x ./install.sh --no-build   # 12 files + manifest; then --uninstall
