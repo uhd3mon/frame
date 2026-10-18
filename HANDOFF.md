@@ -1,13 +1,253 @@
-# HANDOFF — Clipped (repo folder still `clip`)
+# HANDOFF — Frame (formerly Clipped; repo folder `frame`, was `clip`)
 
 ## Goal
 
 Background screenshot / replay / recording tool driven by global
-shortcuts, one config file; `bin/clipped` is the engine, `clipped-gui`
-(Rust) an optional tray + settings window. Saves to
-`<save_dir>/clipped/images` and
-`/videos`, copies to the clipboard, works on KDE, GNOME, Hyprland, Sway
-and X11. MIT, all our own code (no Hyprshot code).
+shortcuts, one config file; `bin/frame` is the engine, `frame-gui`
+(Rust) the tray + settings window, and the tray running = Frame running
+(it keeps the daemon and replay buffer alive). Saves to
+`<save_dir>/frame/images` and `/videos`, copies to the clipboard, works
+on KDE, GNOME, Hyprland, Sway and X11. MIT, all our own code (no
+Hyprshot code). Sections below this one are history and use the old
+names (clip, clipped).
+
+## Frame 0.3.0: Sora's check + real install (2026-10-17 ~23:58)
+
+Kevin asked: modern GUI, start at login with all settings, replay
+buffer always on while Frame runs, rename Clipped -> Frame, blue icon,
+rename the repo folder to `frame`. Atlas: rename + tray-owned daemon
+(daemon.rs) + Nova's engine/install fixes. Strata: blue icons,
+theme.rs, settings restyle (design/gui.md, design/settings-mockup.png)
++ Nova's settings fixes. Nova: review (no blockers; all items fixed,
+see sections below). Atlas's call, approved: the tray always runs
+`frame daemon` (shortcuts), replay = false just drops the buffer.
+
+- Checks (Sora): `bash -n bin/frame` ok; smoke "114 checks, all
+  passed"; cargo test "55 passed; 0 failed"; clippy 0 warnings.
+- `./install.sh` (real): removed the old Clipped install (tray, unbind,
+  its 12 files, autostart), installed 12 Frame files + manifest, wrote
+  ~/.config/autostart/frame-gui.desktop. Installed bins cmp-equal.
+  frame.desktop has absolute Exec + the X-KDE ScreenShot2 key.
+- Started the tray: `frame daemon` + gsr `-w DP-2 … -r 60 -replay-storage
+  ram` running; `frame status` = replay running, 60s buffer;
+  ~/.config/frame/config copied from clipped (video_source = DP-2,
+  Kevin's 6 binds). kglobalaccel frame_<a>_desktop isActive = true for
+  all 6. Tray ToolTip "Frame: replay buffer 60 s".
+- Real `frame monitor` (temp config, clipboard/notify off): rc 0,
+  2560x1440 PNG, no spectacle.
+- SIGTERM tray -> tray, daemon and gsr all gone within 12 s; started
+  again -> daemon + 60 s replay back.
+- `~/.config/frame`, `~/.local/share/frame` already held leftover files
+  of a Godot-based app (Sep 16); no name clash, left alone.
+- Not tested: a real login (autostart), real key presses (Record
+  dialog Tab/Enter/Esc, shortcuts), a real region drag, the tray menu
+  clicked in the panel. Old captures stay in ~/Documents/clipped.
+
+## Nova's review of the Frame rename: engine/install items (2026-10-17, Atlas, uncommitted for Sora's review)
+
+Strata did settings.rs in parallel; this round didn't touch
+settings.rs or theme.rs.
+
+- P1 install.sh `remove_clipped`: a real install (no DESTDIR) that finds
+  `$ROOT/share/clipped/installed` runs after the build and before it
+  copies anything. It runs `stop_gui clipped-gui` (matched by exe), then
+  the old `bin/clipped service off` and `unbind` (only if the old
+  manifest lists bin/clipped and it is executable). Then it removes
+  `autostart/clipped-gui.desktop` if it starts that clipped-gui, and the
+  listed files plus the manifest. `~/.config/clipped` and
+  `<save_dir>/clipped` are never touched. `stop_gui NAME`,
+  `remove_autostart FILE NAME` and `remove_listed MANIFEST` are now
+  shared with uninstall.
+- P2 `frame daemon`: daemon.pid and the TERM/INT trap are set right after
+  the flock, before `cmd_bind` (not in dry run, as before). Lock busy now
+  exits 3. The unit gets `RestartPreventExitStatus=3`. The tray's
+  Supervisor already treats an exit with a live foreign daemon.pid as
+  External, so it needed no change.
+- P2 decision: `frame service on` **refuses** (exit 1) while tray.pid is
+  live: "the Frame tray (frame-gui, pid N) already runs the daemon; quit
+  it first, or keep using the tray". A warning alone would leave a
+  service daemon that loses the lock (or takes over after a tray
+  restart). `service off` is always allowed.
+- P3 daemon.rs: `seen`/`started_with` are recorded after `frame check`
+  (`remember_config`), so a config that the check's migration just
+  copied doesn't trigger a restart on the first tick. The External path
+  still records before returning. New test
+  `config_copied_by_check_is_not_a_change` (the fake `check` copies
+  MIGRATE to a missing config).
+- P3 PDEATHSIG race: the parent pid is taken before spawn; after prctl,
+  pre_exec `_exit(0)`s if getppid() differs. The Supervisor lives on the
+  tray's main thread, so PDEATHSIG's "parent thread exits" rule doesn't
+  fire early.
+- P3 uninstall/stop_gui waits 12 s (120 × 0.1 s), up from 3 s.
+- P4 README: old captures stay in `<save_dir>/clipped`, the config copy
+  leaves the old file, the Clipped upgrade path, and service vs. tray.
+- smoke.sh +5 checks: pid + trap before bind (a fake slow hyprctl sees
+  daemon.pid; TERM during bind stops it before the idle loop), lock busy
+  = 3 (`flock -n` holds daemon.lock), unit has RestartPreventExitStatus=3
+  (fake systemctl, real write in temp XDG_CONFIG_HOME), service on
+  refused with a live tray.pid, and install over a fake old Clipped
+  (temp PREFIX; logger bin/clipped, sleep copy as clipped-gui; DESTDIR
+  install leaves it alone).
+- Lesson: fakes on the `fakesleep` PATH that call `sleep` themselves get
+  logged as daemon sleeps; use /usr/bin/sleep inside fakes.
+
+Checks run: `bash -n bin/frame` ok; `bash tests/smoke.sh` twice, "114
+checks, all passed" (once before the fix above: 1 FAIL, the test's own
+sleep); `cargo test` 6 runs, all "test result: ok. 55 passed" (52 + my
+1 + 2 more in the tree, which Strata is also editing); `cargo clippy --all-targets`
+0 warnings (after touching main.rs to force a recheck). Nothing
+installed, nothing committed; Kevin's running Clipped not touched.
+
+## Flaky supervisor test fixed (2026-10-17, Atlas, uncommitted for Sora's review)
+
+`daemon::tests::starts_restarts_with_backoff_and_stops` failed about
+1 run in 13 in parallel with `Retry { why: "cannot run …/frame: Text
+file busy (os error 26)" }`. Cause: another test thread forked while
+`fake_frame` still had the script open for writing. The forked child
+holds that write fd until it execs, so exec of the script got ETXTBSY.
+Writing to a temp name and renaming would not help, because the inode
+stays the same. Fix (only in `daemon.rs` tests): `wait_execable` runs
+the new script (no args, exits 0) and retries on ETXTBSY for up to
+~1 s. Our own fd is already closed, so after one successful exec no
+later fork can bring the error back. The 369 assert now prints the view.
+The real tray never writes its `frame` binary, so it can't hit this
+itself. If install.sh is replacing bin/frame at that moment, the spawn
+fails and the normal 2 s backoff retries it.
+Checks: 60 consecutive `cargo test` runs (20 + 40), all "52 passed";
+`cargo clippy --all-targets` 0 warnings.
+
+## Rename to Frame + tray owns the daemon (2026-10-17, Atlas, uncommitted for Sora's review)
+
+Kevin: rename Clipped → Frame; Frame starts at login with all settings,
+and the replay buffer runs whenever Frame runs. Strata did the icons
+(`gui/icons/frame*.svg`, `png/frame-*.png`) and `gui/src/theme.rs`
+(not wired into main.rs yet); Atlas did the rest. Version 0.3.0.
+
+- Rename like clip→clipped: `bin/frame`, `frame-gui`, `FRAME_*` env,
+  `~/.config/frame/config`, `<save_dir>/frame/…`, XDG dirs `…/frame`,
+  `frame.service`, KDE `frame-<action>.desktop` / component
+  `frame_<action>_desktop`, GNOME `…/custom-keybindings/frame-<a>/`,
+  `notify-send -a frame`, `frame.desktop` (absolute Exec + X-KDE key
+  kept), manifest `share/frame/installed`, titles "Frame". "Clip saved"
+  toast kept. Internal Rust names (`clip_bin`, `ClipTray`) unchanged.
+- `migrate_config` in bin/frame (runs before load_config for every
+  command but --help/--version/monitors): only when `FRAME_CONFIG` is
+  unset, `~/.config/frame/config` doesn't exist (not even as a link) and
+  `~/.config/clipped/config` is a file: `cp -p`, stderr note "frame:
+  note: copied your Clipped config A to B". Nothing else is migrated.
+  The settings window runs `frame check` once at start when there is no
+  config, so the copy happens before it reads.
+- `gui/src/daemon.rs` (new) `Supervisor`: the tray runs `frame daemon`
+  as a child (own process group, PR_SET_PDEATHSIG=TERM, output to
+  `$RUNDIR/daemon.log`, reset past 1 MiB). Before each start it runs
+  `frame check`: exit 2 → BadConfig (no retry until the file's bytes
+  change). A live `daemon.pid` that isn't ours (frame.service, a
+  terminal) → External: left alone, ours starts when it disappears; a
+  daemon-key change then runs `systemctl --user restart frame.service`
+  if the service is active. Unasked exit → retry after 2, 4, … 60 s
+  (reset after 60 s of running), reason = last line of daemon.log. Each
+  second the tray re-reads the config; if any `config::DAEMON_KEYS`
+  value differs from what the daemon started with, it restarts it (so
+  replay off/on in settings stops/starts the buffer). Stop = TERM, wait
+  10 s, then KILL the group.
+- Design choice (differs from the brief): the tray always runs the
+  daemon, also with `replay = false` (the daemon then only binds and
+  idles). Hyprland/Sway shortcuts last only while something re-applies
+  them at session start, and it makes "replay off → on" a plain restart.
+- `tray.rs`: Quit and SIGTERM/SIGINT/SIGHUP set an atomic; the main loop
+  (200 ms) stops the daemon, removes `$RUNDIR/tray.pid`, shuts ksni down.
+  Menu: "Replay buffer: on, 60 s" / off / starting… / off (config
+  error) + a problem line, then record, save replay, screenshots, Open
+  Frame folder, Settings…, Quit. "Background service" toggle removed.
+  Tooltip description = the problem, if any.
+- `settings.rs` (functional only): "Restart service" button and
+  `restart_service` gone; after a Save that changes daemon keys the note
+  is "Frame restarts the replay buffer with the new settings." when
+  tray.pid is live, else a hint to restart `frame daemon` / the service.
+  Startup section: "Start Frame when I log in" (autostart/frame-gui.desktop;
+  Comment "Frame tray: shortcuts and replay buffer").
+- `install.sh`: a first real install (no DESTDIR, no manifest before)
+  writes the same autostart entry unless `--no-autostart`; reinstalls
+  keep the user's choice. Options can come in any order; unknown ones
+  are refused.
+- Tests: smoke +2 (migration once/default path only; autostart on first
+  real install only, --no-autostart, DESTDIR none, unknown option).
+  cargo +5 (4 supervisor tests with a fake frame script: backoff 2→4 s,
+  stop, daemon-key restart vs. other keys, bad config waits for a
+  change, external daemon left alone + taken over; tray replay_lines)
+  and an exact-text autostart check shared with smoke.
+
+Checks run (see the report to Sora for the printed lines): bash -n,
+smoke, cargo test, cargo clippy --all-targets, cargo build --release.
+Live, private bus (`dbus-run-session`, temp XDG dirs): release tray +
+fake frame: start, restart on `replay = false`, restart 2 s after
+KILL of the daemon, TERM → daemon got TERM, tray rc 0, tray.pid gone.
+Release tray + real bin/frame (XDG_CURRENT_DESKTOP=none, replay off):
+`video_fps = 999` → no daemon, tooltip "Frame: not running" / "Config
+error: video_fps must be 1-240"; fixed → `frame status` "daemon:
+running"; TERM → "daemon: stopped", log ends "frame: daemon stopped".
+
+Next: Sora migrates Kevin's machine (stop clipped tray + clipped.service,
+`clipped unbind`, remove the clipped autostart/desktop entries,
+`./install.sh`, start frame-gui). Not tested: a real login autostart,
+the real KDE panel menu, gsr replay under the tray (only the fake).
+Strata restyles settings.rs next and wires theme.rs.
+
+## Settings window restyle, phase 2 (2026-10-17, Strata, uncommitted for Sora's review)
+
+Only `gui/src/settings.rs` (UI part) and `gui/src/main.rs` (`mod theme;`)
+changed; theme.rs, config/state/daemon/tray untouched. Look =
+`design/settings-mockup.png` (spec in `design/gui.md`).
+
+- `theme::apply` runs in the settings creator. Window 600x900, min
+  520x480, resizable; body scrolls.
+- Header: app icon (APP_64 texture) + "Frame" + subtitle, right-aligned
+  `status_pill` from `Status::read` + `tray_running` (re-read once a
+  second): "Recording · m:ss" (RED, age of record.pid), "Replay on · 60 s"
+  (ACCENT), "Replay off" (daemon up, no buffer), "Starting…" (AMBER, tray
+  up, no daemon), "Not running".
+- Four `theme::card`s: Saving, Video & replay, Shortcuts, Startup; every
+  line is `theme::row` (132 px label column); on/off = `toggle_label`.
+- Friendly combo labels, raw values written: PNG/JPEG/WebP, MP4/WebM/MKV,
+  Medium…Ultra, codecs ("Auto (best for the GPU)", "HEVC (H.265)"…), Frame
+  rate = combo 24…240 fps (+ the configured valid value if unlisted).
+  Audio = Desktop audio / Microphone / Desktop + microphone
+  (`default_output|default_input`) / No audio / Custom… (text field; any
+  non-preset value opens as Custom). Values frame refuses show as the file
+  has them + red "config has 'x'" (combos, toggles, replay length).
+- Shortcuts: keycaps + Record + Clear per action. Record opens the
+  shortcut editor as a themed `egui::Modal` already listening (KeyTap,
+  Recorder unchanged: up to 3 keys, Stop, Esc cancels); without KeyTap
+  (tests) it opens not listening. The dialog keeps Meta/Ctrl/Alt/Shift
+  (now toggle chips) + key list, Set/Cancel; a click outside cancels
+  (never while listening). The per-row free-text shortcut field is gone
+  (the editor covers it; invalid file values show red in the keycaps
+  slot). "Turn on shortcuts" = primary button at the top of the card.
+- Sticky bottom bar: status text (red error / green "Saved." / muted),
+  AMBER dot "Unsaved changes", Revert (Reload on read error), accent Save
+  (grey when disabled), spinner while `frame bind` runs. Save/bind/
+  autostart/restart-note logic is unchanged.
+- `FRAME_GUI_SHOT_VIEW` (only with FRAME_GUI_SHOT): `end` scrolls to the
+  bottom, an action name (`region`…) opens its editor, for shots.
+- Shots (temp XDG dirs, temp FRAME_CONFIG, FRAME_BIN=bin/frame, dry run;
+  replay pill via fake pid files naming a `sleep`): shots/frame-settings.png,
+  frame-settings-end.png, frame-shortcut-editor.png,
+  frame-settings-invalid.png (all 600x900). Script used: /tmp/frame-shot.sh
+  (not in repo).
+- New tests: friendly_labels_keep_config_values, header_pill; the
+  raw-value test also runs `frame check` on each audio preset.
+- Checks run: `cargo test` "test result: ok. 52 passed" (but see flake
+  below); `cargo clippy --all-targets` 0 warnings; `bash tests/smoke.sh`
+  "109 checks, all passed"; `bash -n bin/frame` ok.
+- Known flake (not from this change, for Atlas):
+  `daemon::tests::starts_restarts_with_backoff_and_stops` fails at
+  daemon.rs:369 (`View::Running` expected right after `start`) in ~1 of 5
+  runs, also with only `cargo test daemon::` (5/25), never with
+  `--test-threads=1` (0/10). Likely ETXTBSY: each test writes its fake
+  `frame` script and execs it while a parallel test forks with the write
+  fd open, so `check` fails → Retry.
+- Not done: real key presses in the dialog (no input tool), live window
+  with the real tray, light theme.
 
 ## Sora's check + real install (2026-10-17 ~21:58, uncommitted)
 
@@ -656,4 +896,10 @@ GUI below plus fixes for Nova's round-3 review (next section).
 - Clipped KDE without Spectacle (2026-10-17, Atlas, uncommitted): clipped-gui --grab all|monitor|window|area X Y W H OUT.png (gui/src/grab.rs, zbus =5.15.0 blocking, no new crates) calls KWin ScreenShot2; KWin authorizes it via clipped.desktop Exec + X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2 (install.sh writes it). bin/clipped backend "kwin" on KDE Wayland when clipped-gui found ($CLIPPED_GUI, next to script, PATH); region = slurp → --grab area; spectacle only fallback; kde_region/kde_layout removed. Real KWin grabs verified (all 2560x2880, monitor 2560x1440). Region still needs slurp. Checks: smoke 100, cargo test 40, clippy clean. (Atlas, 2026-10-18)
 - Clipped video source (2026-10-17, Atlas, uncommitted): video_source=auto now = monitor you're on (KDE: KWin activeOutputName via gdbus, must be in gsr --list-monitors; Hyprland/Sway focused; else first). New `clipped monitors` (NAME|WxH[|active]). GUI Source = ComboBox fed by `clipped monitors` (auto / each monitor / portal / screen on X11 / unknown value kept). Replay picks the monitor at daemon start. Checks: smoke 107, cargo test 43, clippy clean. Kevin's config still has video_source = DP-1. (Atlas, 2026-10-18)
 - Clipped 2026-10-17 (uncommitted, installed to ~/.local): KDE Wayland screenshots no longer use Spectacle. `clipped-gui --grab all|monitor|window|area X Y W H OUT` calls KWin org.kde.KWin.ScreenShot2 via zbus; KWin authorizes it because clipped.desktop has absolute Exec + X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2 (never authorize python/gdbus). Spectacle = fallback only. Region still uses slurp. video_source auto on KDE = KWin activeOutputName; `clipped monitors`; GUI Source is a combo. smoke 107, cargo test 43. (Sora, 2026-10-18)
+- Frame GUI phase 1 design (Strata, 2026-10-17, uncommitted): blue icons gui/icons/frame{,-idle,-replay,-recording}.svg (accent #3D8BFF, app gradient #5A9CFF→#1F5BD8), render.sh outputs png/frame-*. gui/src/theme.rs = dark theme + widgets (apply, card, row 132px label col, toggle/toggle_label, primary/secondary_button, status_pill, keycaps, bottom_bar_frame, page_frame); not wired into main.rs yet. Spec + hex table in design/gui.md; target look design/settings-mockup.png (ignored by *.png in .gitignore, needs git add -f or an exception). theme.rs checked via scratch crate /tmp/frame-themecheck (clippy clean, 2 tests). (Strata, 2026-10-18)
+- Frame (renamed from Clipped, 2026-10-17, Atlas, uncommitted, v0.3.0): bin/frame, frame-gui, FRAME_* env, ~/.config/frame/config (one-time copy from ~/.config/clipped/config), <save_dir>/frame/. Tray = Frame running: gui/src/daemon.rs Supervisor runs `frame daemon` as a child (always, even with replay=false), backoff 2..60 s, BadConfig waits for a file change, leaves an external daemon (frame.service) alone, restarts it when config::DAEMON_KEYS change, stops it on Quit/SIGTERM. $RUNDIR/tray.pid, daemon.log. The first real install writes autostart/frame-gui.desktop unless --no-autostart. Checks: smoke 109, cargo test 48, clippy 0. Live-test the tray with dbus-run-session + temp XDG dirs. (Atlas, 2026-10-18)
+- Frame settings restyle phase 2 (2026-10-17, Strata, uncommitted): settings.rs UI rebuilt on theme.rs (main.rs has mod theme; theme::apply in creator). Header icon + live status pill (Status::read + tray_running, 1 s), four cards, sticky bar, friendly combo labels writing raw values, Audio presets + Custom…, shortcut editor = themed egui::Modal opened by row Record (already listening). FRAME_GUI_SHOT_VIEW=end|<action> for shots. Shots in shots/frame-settings*.png, frame-shortcut-editor.png. cargo test 52, clippy 0, smoke 109. daemon::tests::starts_restarts_with_backoff_and_stops is flaky in parallel (~1/5, likely ETXTBSY on the fake frame script), not from this change. (Strata, 2026-10-18)
+- Frame flaky test fixed (2026-10-17, Atlas, uncommitted): daemon backoff test hit ETXTBSY. Another test thread forked while fake_frame's write fd was open; temp+rename can't fix that (same inode). daemon.rs tests now use wait_execable (exec the script, retry on ETXTBSY). 60/60 cargo test runs passed (52 tests each), clippy 0. The real tray isn't affected. (Atlas, 2026-10-18)
+- Frame settings.rs Nova fixes (2026-10-17, Strata, uncommitted): shortcut editor only captures keys in Record (egui key_name capture removed); outside Record Enter = Set (unless Cancel focused or a popup open), Esc = modal close. Codec shows red "not for WebM" (webm_codec = auto|av1|vp8|vp9, same as bin/frame) and Save refuses the pair; emptied Custom audio saves `none`. cargo test 55, clippy --all-targets clean. Shots: shots/frame-settings*.png, frame-shortcut-editor.png. (Strata, 2026-10-18)
+- Frame review round (2026-10-17, Atlas, uncommitted): install.sh removes an old Clipped install (share/clipped/installed) on a real install: stop clipped-gui, clipped service off/unbind, files in its list, autostart/clipped-gui.desktop; keeps ~/.config/clipped and the captures. frame daemon: daemon.pid + TERM trap are set right after flock; lock busy = exit 3; unit has RestartPreventExitStatus=3; `frame service on` refuses while tray.pid is live. daemon.rs reads the config after `frame check` and guards PDEATHSIG with getppid. Checks: smoke 114 passed, cargo test 55 passed, clippy 0. (Atlas, 2026-10-18)
 <!-- workspace:memory:end -->

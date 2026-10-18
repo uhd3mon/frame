@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Frame app icon. Original artwork for the Frame project, MIT licence. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Frame</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5a9cff"/>
+      <stop offset="1" stop-color="#1f5bd8"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#bg)"/>
+  <rect x="6.75" y="6.75" width="114.5" height="114.5" rx="27.25" fill="none" stroke="url(#sheen)" stroke-width="1.5"/>
+  <g fill="none" stroke="#ffffff" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M28 50V40A12 12 0 0 1 40 28H50"/>
+    <path d="M78 28H88A12 12 0 0 1 100 40V50"/>
+    <path d="M100 78V88A12 12 0 0 1 88 100H78"/>
+    <path d="M50 100H40A12 12 0 0 1 28 88V78"/>
+  </g>
+  <circle cx="64" cy="64" r="13" fill="#ffffff"/>
+</svg>

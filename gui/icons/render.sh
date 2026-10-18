@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-names=(clipped clipped-idle clipped-replay clipped-recording)
+names=(frame frame-idle frame-replay frame-recording)
 sizes=(16 22 24 32 48 64)
 
 mkdir -p png
@@ -14,7 +14,7 @@ for n in "${names[@]}"; do
     done
 done
 for s in 128 256; do
-    rsvg-convert -w "$s" -h "$s" clipped.svg -o "png/clipped-$s.png"
+    rsvg-convert -w "$s" -h "$s" frame.svg -o "png/frame-$s.png"
 done
 
 command -v magick >/dev/null || { echo "magick not found; skipped preview.png"; exit 0; }

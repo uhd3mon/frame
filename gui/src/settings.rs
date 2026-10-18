@@ -1,19 +1,14 @@
-//! The settings window: edits the clipped config, checks it with `clipped check`
+//! The settings window: edits the frame config, checks it with `frame check`
 //! before it replaces the real file, and re-applies shortcuts.
 
-use crate::config::{self, ACTIONS};
+use crate::config::{self, ACTIONS, DAEMON_KEYS};
 use crate::state::{self, Status};
+use crate::theme;
 use eframe::egui::{self, Color32, RichText};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc::{channel, Receiver, Sender};
-
-/// Keys the daemon reads only when it starts (replay buffer, file names).
-const DAEMON_KEYS: &[&str] = &[
-    "save_dir", "video_format", "replay", "replay_seconds", "video_source", "video_fps",
-    "video_quality", "video_codec", "audio",
-];
 
 /// Free-text fields: edge spaces are trimmed on Save.
 fn is_text_key(k: &str) -> bool {
@@ -23,8 +18,7 @@ fn is_text_key(k: &str) -> bool {
 enum Msg {
     Folder(PathBuf),
     Monitors(Vec<Monitor>),
-    Status(String, bool),
-    /// Result of `clipped bind`; it replaces "Updating shortcuts…" in the status.
+    /// Result of `frame bind`; it replaces "Updating shortcuts…" in the status.
     Rebind(String, bool),
 }
 
@@ -35,7 +29,7 @@ const UPDATING: &str = "Updating shortcuts…";
 
 const ACTION_NAMES: [&str; 6] = ["Region", "Window", "Monitor", "All monitors", "Save replay", "Record"];
 
-/// The keys the editor offers (bin/clipped key_info takes them all, plus
+/// The keys the editor offers (bin/frame key_info takes them all, plus
 /// F25–F35 and spelling variants).
 fn key_choices() -> Vec<String> {
     let mut v: Vec<String> = [
@@ -51,7 +45,7 @@ fn key_choices() -> Vec<String> {
 }
 
 /// The editor's name for a key part ("print", "PageUp", "f30"), None if
-/// clipped doesn't know it.
+/// frame doesn't know it.
 fn canonical_key(part: &str) -> Option<String> {
     let l = part.to_ascii_lowercase();
     let l = match l.as_str() {
@@ -61,7 +55,7 @@ fn canonical_key(part: &str) -> Option<String> {
     if let Some(k) = key_choices().into_iter().find(|k| k.to_ascii_lowercase() == l) {
         return Some(k);
     }
-    // F25–F35: clipped takes them, the list stops at F24.
+    // F25–F35: frame takes them, the list stops at F24.
     (l.starts_with('f') && config::valid_shortcut(l)).then(|| l.to_ascii_uppercase())
 }
 
@@ -97,7 +91,7 @@ impl Shortcut {
         sc
     }
 
-    /// "Meta+Ctrl+Alt+Shift+Key", the order clipped's defaults use.
+    /// "Meta+Ctrl+Alt+Shift+Key", the order frame's defaults use.
     fn text(&self) -> String {
         let mods = [(self.meta, "Meta"), (self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift")];
         let mut parts: Vec<&str> = mods.iter().filter(|m| m.0).map(|m| m.1).collect();
@@ -123,7 +117,7 @@ enum Part {
 enum KeyEv {
     Down(Part),
     Up(Part),
-    /// A key clipped can't bind (comma, AltGr, …) was pressed.
+    /// A key frame can't bind (comma, AltGr, …) was pressed.
     Other,
     /// The window lost focus: releases may never come.
     Reset,
@@ -165,7 +159,7 @@ impl Recorder {
                 }
                 self.held.push(p.clone());
                 if self.combo.len() < 3 && !self.combo.contains(&p) {
-                    // clipped takes one key: a second one replaces the first.
+                    // frame takes one key: a second one replaces the first.
                     if matches!(p, Part::Key(_)) {
                         self.combo.retain(|q| !matches!(q, Part::Key(_)));
                     }
@@ -297,6 +291,8 @@ struct Editor {
     sc: Shortcut,
     /// Record is listening.
     rec: Option<Recorder>,
+    /// The Cancel button (last frame): Enter on it cancels instead of Set.
+    cancel: Option<egui::Id>,
 }
 
 struct App {
@@ -313,24 +309,31 @@ struct App {
     /// Set when the config exists but can't be read: Save is off, so the
     /// template can never replace a file we failed to read.
     read_error: Option<String>,
-    /// A `clipped bind` is in flight; Save waits for it.
+    /// A `frame bind` is in flight; Save waits for it.
     rebinding: bool,
-    offer_restart: bool,
-    /// From `clipped monitors`; None until it answers.
+    /// From `frame monitors`; None until it answers.
     monitors: Option<Vec<Monitor>>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     ctx: egui::Context,
-    /// CLIPPED_GUI_SHOT=FILE.png: save this window's own frame and quit (docs, review).
+    /// FRAME_GUI_SHOT=FILE.png: save this window's own frame and quit (docs, review).
     shot: Option<(PathBuf, u32)>,
+    /// FRAME_GUI_SHOT_VIEW=end (with FRAME_GUI_SHOT): scroll to the bottom first.
+    shot_end: bool,
+    /// The user picked "Custom…" for audio while the value is a preset.
+    audio_custom: bool,
+    /// Header pill: pid-file status, tray running, recording for how long.
+    live: (Status, bool, Option<std::time::Duration>),
+    live_at: Option<std::time::Instant>,
+    icon: Option<egui::TextureHandle>,
 }
 
 pub fn run() -> i32 {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Clipped settings")
-        .with_app_id("clipped")
-        .with_inner_size([560.0, 720.0])
-        .with_min_inner_size([440.0, 360.0]);
+        .with_title("Frame settings")
+        .with_app_id("frame")
+        .with_inner_size([600.0, 900.0])
+        .with_min_inner_size([520.0, 480.0]);
     if let Some((w, h, rgba)) = crate::icons::rgba(crate::icons::APP_64) {
         viewport = viewport.with_icon(egui::IconData { rgba, width: w, height: h });
     }
@@ -339,22 +342,23 @@ pub fn run() -> i32 {
     let event_loop = match winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event().build() {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("clipped-gui: {e}");
+            eprintln!("frame-gui: {e}");
             return 1;
         }
     };
     let keys = KeyQueue::default();
     let app_keys = keys.clone();
     let creator: eframe::AppCreator = Box::new(move |cc| {
+        theme::apply(&cc.egui_ctx);
         let mut app = App::new(&cc.egui_ctx);
         app.keys = Some(app_keys);
         Ok(Box::new(app))
     });
-    let mut tap = KeyTap { inner: eframe::create_native("Clipped", opts, creator, &event_loop), keys };
+    let mut tap = KeyTap { inner: eframe::create_native("Frame", opts, creator, &event_loop), keys };
     match event_loop.run_app(&mut tap) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("clipped-gui: {e}");
+            eprintln!("frame-gui: {e}");
             1
         }
     }
@@ -365,7 +369,7 @@ fn run_clip(args: &[&str], config: Option<&Path>) -> Result<Output, String> {
     let mut c = Command::new(&bin);
     c.args(args);
     if let Some(p) = config {
-        c.env("CLIPPED_CONFIG", p);
+        c.env("FRAME_CONFIG", p);
     }
     c.output().map_err(|e| format!("cannot run {}: {e}", bin.display()))
 }
@@ -379,7 +383,7 @@ fn stderr_of(o: &Output) -> String {
     }
 }
 
-/// Escape a path for a desktop entry Exec= line (same as desktop_arg in bin/clipped).
+/// Escape a path for a desktop entry Exec= line (same as desktop_arg in bin/frame).
 pub fn desktop_exec_arg(p: &str) -> String {
     if p.chars().all(|c| c.is_ascii_alphanumeric() || "/._+-".contains(c)) {
         return p.to_string();
@@ -397,7 +401,7 @@ pub fn desktop_exec_arg(p: &str) -> String {
 
 pub fn autostart_entry(exe: &str) -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nName=Clipped\nComment=clipped tray icon\nExec={}\nIcon=clipped\n\
+        "[Desktop Entry]\nType=Application\nName=Frame\nComment=Frame tray: shortcuts and replay buffer\nExec={}\nIcon=frame\n\
          Terminal=false\nX-GNOME-Autostart-enabled=true\n",
         desktop_exec_arg(exe)
     )
@@ -430,7 +434,7 @@ pub fn resolve_link(path: &Path) -> Result<PathBuf, String> {
 }
 
 /// Write TEXT as the config at PATH: a new temp file next to the real
-/// one (same mode, synced), `clipped check` on it, then rename. The real
+/// one (same mode, synced), `frame check` on it, then rename. The real
 /// file (or a symlink's target, never the link) is untouched on failure.
 pub fn write_checked(path: &Path, text: &[u8]) -> Result<(), String> {
     use std::io::Write;
@@ -442,7 +446,7 @@ pub fn write_checked(path: &Path, text: &[u8]) -> Result<(), String> {
     let mode = std::fs::metadata(&real).ok().map(|m| m.permissions().mode() & 0o7777);
     let mut opened = None;
     for i in 0..100 {
-        let tmp = dir.join(format!(".{name}.clipped-gui-{}-{i}.tmp", std::process::id()));
+        let tmp = dir.join(format!(".{name}.frame-gui-{}-{i}.tmp", std::process::id()));
         match std::fs::OpenOptions::new().write(true).create_new(true).mode(mode.unwrap_or(0o644)).open(&tmp) {
             Ok(f) => {
                 opened = Some((tmp, f));
@@ -483,9 +487,9 @@ pub fn write_checked(path: &Path, text: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// The text `clipped config` would write, made in a temp path (not the real one).
+/// The text `frame config` would write, made in a temp path (not the real one).
 fn template(dir: &Path) -> String {
-    let t = dir.join(format!(".clipped-gui-template-{}", std::process::id()));
+    let t = dir.join(format!(".frame-gui-template-{}", std::process::id()));
     let _ = std::fs::create_dir_all(dir);
     let _ = run_clip(&["config"], Some(&t));
     let text = std::fs::read_to_string(&t).unwrap_or_default();
@@ -493,29 +497,17 @@ fn template(dir: &Path) -> String {
     text
 }
 
-/// clipped's name for an egui key (see key_info in bin/clipped).
-fn key_name(k: egui::Key) -> Option<String> {
-    use egui::Key::*;
-    let s = match k {
-        Escape => "Esc", Tab => "Tab", Backspace => "Backspace", Enter => "Return",
-        Insert => "Ins", Delete => "Del", Home => "Home", End => "End", PageUp => "PgUp",
-        PageDown => "PgDown", ArrowLeft => "Left", ArrowRight => "Right", ArrowUp => "Up",
-        ArrowDown => "Down", Space => "Space",
-        _ => {
-            let n = k.name();
-            let ok = (n.len() == 1 && n.chars().all(|c| c.is_ascii_alphanumeric()))
-                || (n.starts_with('F') && config::valid_shortcut(n));
-            return ok.then(|| n.to_string());
-        }
-    };
-    Some(s.to_string())
-}
-
 impl App {
     fn new(ctx: &egui::Context) -> App {
         let (tx, rx) = channel();
+        let path = state::config_path();
+        // A first start after the rename: `frame check` copies the Clipped
+        // config to the new place before we read it.
+        if !cfg!(test) && matches!(read_config(&path), Ok(None)) {
+            let _ = run_clip(&["check"], None);
+        }
         let mut app = App {
-            path: state::config_path(),
+            path,
             loaded: BTreeMap::new(),
             vals: BTreeMap::new(),
             autostart_loaded: false,
@@ -526,14 +518,29 @@ impl App {
             error: false,
             read_error: None,
             rebinding: false,
-            offer_restart: false,
             monitors: None,
             tx,
             rx,
             ctx: ctx.clone(),
-            shot: std::env::var_os("CLIPPED_GUI_SHOT").map(|p| (PathBuf::from(p), 0)),
+            shot: std::env::var_os("FRAME_GUI_SHOT").map(|p| (PathBuf::from(p), 0)),
+            shot_end: false,
+            audio_custom: false,
+            live: Default::default(),
+            live_at: None,
+            icon: crate::icons::rgba(crate::icons::APP_64).map(|(w, h, rgba)| {
+                let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                ctx.load_texture("frame-icon", img, egui::TextureOptions::LINEAR)
+            }),
         };
         app.load();
+        // FRAME_GUI_SHOT_VIEW: "end" scrolls down, an action opens its shortcut editor.
+        if app.shot.is_some() {
+            let view = std::env::var("FRAME_GUI_SHOT_VIEW").unwrap_or_default();
+            app.shot_end = view == "end";
+            if let Some(a) = ACTIONS.iter().find(|a| **a == view) {
+                app.editor = Some(Editor { field: a, sc: Shortcut::parse(&app.vals[&format!("bind.{a}")]), rec: None, cancel: None });
+            }
+        }
         if cfg!(test) {
             return app;
         }
@@ -557,7 +564,7 @@ impl App {
         self.autostart_loaded = state::autostart_file().exists();
         self.autostart = self.autostart_loaded;
         self.editor = None;
-        self.offer_restart = false;
+        self.audio_custom = false;
         let error = read_error.is_some();
         self.read_error = read_error;
         self.set_status(status, error);
@@ -580,7 +587,7 @@ impl App {
         !self.changes().is_empty() || self.autostart != self.autostart_loaded
     }
 
-    /// First problem with the edited values, checked before clipped sees them.
+    /// First problem with the edited values, checked before frame sees them.
     fn problem(&self, changes: &BTreeMap<String, String>) -> Option<String> {
         for (k, v) in changes {
             if let Some(why) = config::unrepresentable(v) {
@@ -589,6 +596,11 @@ impl App {
             if k.starts_with("bind.") && !v.is_empty() && !config::valid_shortcut(v) {
                 return Some(format!("{k}: '{v}' is not a shortcut (example: Meta+Alt+R)."));
             }
+        }
+        let (fmt, codec) = (&self.vals["video_format"], &self.vals["video_codec"]);
+        let pair_changed = changes.contains_key("video_format") || changes.contains_key("video_codec");
+        if pair_changed && fmt == "webm" && config::valid_value("video_codec", codec) && !webm_codec(codec) {
+            return Some(format!("{WEBM_CODECS} (codec is {codec})."));
         }
         None
     }
@@ -601,6 +613,10 @@ impl App {
             if is_text_key(k) && v.trim() != v {
                 *v = v.trim().to_string();
             }
+        }
+        // An emptied Custom… audio field means no audio (frame needs a value).
+        if self.vals.get("audio").is_some_and(|v| v.is_empty()) && self.loaded.get("audio").is_some_and(|v| !v.is_empty()) {
+            self.vals.insert("audio".into(), "none".into());
         }
         let changes = self.changes();
         if let Some(p) = self.problem(&changes) {
@@ -623,23 +639,23 @@ impl App {
         }
         if self.autostart != self.autostart_loaded {
             match self.write_autostart() {
-                Ok(()) => notes.push(if self.autostart { "Tray starts at login." } else { "Tray no longer starts at login." }.into()),
+                Ok(()) => notes.push(if self.autostart { "Frame starts when you log in." } else { "Frame no longer starts at login." }.into()),
                 Err(e) => errors.push(format!("Start at login not changed: {e}.")),
             }
         }
         self.load();
-        let daemon = Status::read(Path::new("/proc"), &state::rundir()).daemon;
-        // Never bound: a first Save turns shortcuts on (clipped bind needs no daemon).
+        let (proc_root, rundir) = (Path::new("/proc"), state::rundir());
+        // Never bound: a first Save turns shortcuts on (frame bind needs no daemon).
         if changes.keys().any(|k| k.starts_with("bind.")) || !state::binds_state().exists() {
             notes.push(UPDATING.into());
             self.rebind();
         }
-        if daemon && needs_daemon_restart(&changes) {
-            if crate::tray::service_active() {
-                self.offer_restart = true;
-                notes.push("Restart the service to use the new video settings.".into());
-            } else {
-                notes.push("Restart `clipped daemon` to use the new video settings.".into());
+        // The tray sees the new file and restarts the daemon itself.
+        if needs_daemon_restart(&changes) {
+            if state::tray_running(proc_root, &rundir) {
+                notes.push("Frame restarts the replay buffer with the new settings.".into());
+            } else if Status::read(proc_root, &rundir).daemon {
+                notes.push("Restart `frame daemon` (or frame.service) to use the new video settings.".into());
             }
         }
         let error = !errors.is_empty();
@@ -647,7 +663,7 @@ impl App {
         self.set_status(notes.join(" "), error);
     }
 
-    /// clipped never bound anything and Save won't: offer "Turn on shortcuts".
+    /// frame never bound anything and Save won't: offer "Turn on shortcuts".
     fn shortcuts_inactive(&self) -> bool {
         !self.dirty() && !self.rebinding && self.read_error.is_none() && !state::binds_state().exists()
     }
@@ -665,7 +681,7 @@ impl App {
         std::fs::write(&f, autostart_entry(&exe.to_string_lossy())).map_err(|e| format!("{}: {e}", f.display()))
     }
 
-    /// `clipped bind` (it removes what it bound last time first), off the UI
+    /// `frame bind` (it removes what it bound last time first), off the UI
     /// thread. One at a time: Save is off until it reports.
     fn rebind(&mut self) {
         self.rebinding = true;
@@ -682,27 +698,11 @@ impl App {
         });
     }
 
-    fn restart_service(&mut self) {
-        self.offer_restart = false;
-        self.set_status("Restarting the service…".into(), false);
-        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-        std::thread::spawn(move || {
-            let r = Command::new("systemctl").args(["--user", "restart", "clipped.service"]).output();
-            let msg = match r {
-                Ok(o) if o.status.success() => ("Service restarted.".into(), false),
-                Ok(o) => (format!("Restart failed: {}", stderr_of(&o)), true),
-                Err(e) => (format!("Restart failed: {e}"), true),
-            };
-            let _ = tx.send(Msg::Status(msg.0, msg.1));
-            ctx.request_repaint();
-        });
-    }
-
     fn browse(&self) {
         let start = state::expand_dir(&self.vals["save_dir"]);
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
-            let mut d = rfd::FileDialog::new().set_title("Clipped: save folder");
+            let mut d = rfd::FileDialog::new().set_title("Frame: save folder");
             if start.is_dir() {
                 d = d.set_directory(start);
             }
@@ -726,7 +726,6 @@ impl App {
                     self.vals.insert("save_dir".into(), v);
                 }
                 Msg::Monitors(l) => self.monitors = Some(l),
-                Msg::Status(s, e) => self.set_status(s, e),
                 Msg::Rebind(s, e) => {
                     self.rebinding = false;
                     self.status = if self.status.contains(UPDATING) {
@@ -740,28 +739,26 @@ impl App {
         }
     }
 
-    /// While the editor is open but not recording, a key press egui sees
-    /// fills the key and Ctrl/Alt/Shift (egui on Linux sees neither Meta nor
-    /// Print, so the Meta box is left alone; Record sees both). Esc alone
-    /// cancels.
+    /// Keys in the shortcut editor. Only Record captures keys; otherwise
+    /// egui keeps them (Tab moves focus, Space presses the focused button,
+    /// Esc cancels via the modal) and Enter means Set, unless Cancel has
+    /// focus or a key list is open.
     fn edit_keys(&mut self, ctx: &egui::Context) {
         self.record_keys(ctx);
-        if self.editor.is_none() || ctx.wants_keyboard_input() {
+        let Some(ed) = self.editor.as_ref() else { return };
+        if ed.rec.is_some() || egui::Popup::is_any_open(ctx) {
             return;
         }
-        let events = ctx.input(|i| i.events.clone());
-        for e in events {
-            if let egui::Event::Key { key, pressed: true, modifiers, .. } = e {
-                if key == egui::Key::Escape && !modifiers.any() {
-                    self.editor = None;
-                    return;
-                }
-                let (Some(ed), Some(name)) = (self.editor.as_mut(), key_name(key)) else { continue };
-                ed.sc.key = name;
-                ed.sc.ctrl = modifiers.ctrl;
-                ed.sc.alt = modifiers.alt;
-                ed.sc.shift = modifiers.shift;
-            }
+        let focus = ctx.memory(|m| m.focused());
+        if focus.is_some() && focus == ed.cancel {
+            return;
+        }
+        if !ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+            return;
+        }
+        if !ed.sc.key.is_empty() {
+            self.vals.insert(format!("bind.{}", ed.field), ed.sc.text());
+            self.editor = None;
         }
     }
 
@@ -818,7 +815,7 @@ impl App {
             w.write_image_data(img.as_raw()).map_err(|e| e.to_string())
         });
         if let Err(e) = r {
-            eprintln!("clipped-gui: {}: {e}", path.display());
+            eprintln!("frame-gui: {}: {e}", path.display());
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
@@ -828,49 +825,109 @@ impl App {
     }
 }
 
-fn combo(ui: &mut egui::Ui, id: &str, v: &mut String, options: &[&str]) {
-    egui::ComboBox::from_id_salt(id).selected_text(v.as_str()).show_ui(ui, |ui| {
-        for o in options {
-            ui.selectable_value(v, o.to_string(), *o);
-        }
-    });
+/// A config value and the text the window shows for it.
+type Choice = (&'static str, &'static str);
+
+const IMAGE_FORMATS: &[Choice] = &[("png", "PNG"), ("jpg", "JPEG"), ("webp", "WebP")];
+const VIDEO_FORMATS: &[Choice] = &[("mp4", "MP4"), ("webm", "WebM"), ("mkv", "MKV")];
+const QUALITIES: &[Choice] = &[("medium", "Medium"), ("high", "High"), ("very_high", "Very high"), ("ultra", "Ultra")];
+const CODECS: &[Choice] = &[
+    ("auto", "Auto (best for the GPU)"), ("h264", "H.264"), ("hevc", "HEVC (H.265)"), ("av1", "AV1"), ("vp8", "VP8"),
+    ("vp9", "VP9"), ("hevc_hdr", "HEVC HDR"), ("av1_hdr", "AV1 HDR"), ("hevc_10bit", "HEVC 10-bit"), ("av1_10bit", "AV1 10-bit"),
+];
+/// gpu-screen-recorder -a values; anything else is "Custom…" (a text field).
+const AUDIO: &[Choice] = &[
+    ("default_output", "Desktop audio"),
+    ("default_input", "Microphone"),
+    ("default_output|default_input", "Desktop + microphone"),
+    ("none", "No audio"),
+];
+const FPS: [u32; 9] = [24, 30, 48, 60, 75, 90, 120, 144, 240];
+const COMBO_WIDTH: f32 = 200.0;
+const KEYCAPS_WIDTH: f32 = 180.0;
+
+fn choices(c: &[Choice]) -> Vec<(String, String)> {
+    c.iter().map(|(v, l)| (v.to_string(), l.to_string())).collect()
 }
 
-/// The file's value when clipped would refuse it, so the widget's fallback
-/// (unchecked, 60, …) isn't taken for what the file says.
-fn raw_note(ui: &mut egui::Ui, key: &str, v: &str) {
-    if !config::valid_value(key, v) {
-        ui.colored_label(Color32::from_rgb(0xe0, 0x50, 0x50), format!("config has '{v}'"))
-            .on_hover_text("clipped refuses this value; pick a valid one before saving");
+/// Frame rates offered, plus the configured one if it is valid but not listed.
+fn fps_choices(current: &str) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = FPS.iter().map(|n| (n.to_string(), format!("{n} fps"))).collect();
+    if config::valid_value("video_fps", current) && !v.iter().any(|c| c.0 == current) {
+        let n: u32 = current.parse().unwrap_or(60);
+        let at = v.iter().position(|c| c.0.parse::<u32>().unwrap_or(0) > n).unwrap_or(v.len());
+        v.insert(at, (n.to_string(), format!("{n} fps")));
+    }
+    v
+}
+
+/// What a combo shows for V: its label, or the value as the file has it.
+fn shown_label(v: &str, choices: &[(String, String)]) -> String {
+    match choices.iter().find(|c| c.0 == v) {
+        Some(c) => c.1.clone(),
+        None if v.is_empty() => "(empty)".into(),
+        None => v.to_string(),
     }
 }
 
-fn combo_row(ui: &mut egui::Ui, key: &str, v: &mut String, options: &[&str]) {
-    ui.horizontal(|ui| {
-        combo(ui, key, v, options);
-        raw_note(ui, key, v);
-    });
-}
-
-fn checkbox(ui: &mut egui::Ui, key: &str, v: &mut String, label: &str) {
-    ui.horizontal(|ui| {
-        let mut b = config::yes(v);
-        if ui.checkbox(&mut b, label).changed() {
-            *v = b.to_string();
+/// A combo with friendly labels that writes the config value.
+fn choice_combo(ui: &mut egui::Ui, key: &str, v: &mut String, choices: &[(String, String)]) {
+    egui::ComboBox::from_id_salt(key).width(COMBO_WIDTH).selected_text(shown_label(v, choices)).show_ui(ui, |ui| {
+        for (val, label) in choices {
+            ui.selectable_value(v, val.clone(), label);
         }
-        raw_note(ui, key, v);
     });
+    raw_note(ui, key, v);
 }
 
-fn number(ui: &mut egui::Ui, key: &str, v: &mut String, range: std::ops::RangeInclusive<u32>, fallback: u32, suffix: &str) {
-    let mut n: u32 = v.parse().ok().filter(|n| range.contains(n)).unwrap_or(fallback);
-    if ui.add(egui::DragValue::new(&mut n).range(range).suffix(suffix)).changed() {
-        *v = n.to_string();
+/// bin/frame's load_config rule: webm takes only these codecs.
+fn webm_codec(c: &str) -> bool {
+    matches!(c, "auto" | "av1" | "vp8" | "vp9")
+}
+const WEBM_CODECS: &str = "WebM needs codec Auto, AV1, VP8 or VP9";
+
+/// The file's value when frame would refuse it, so the widget's fallback
+/// (off, 60, …) isn't taken for what the file says.
+fn raw_note(ui: &mut egui::Ui, key: &str, v: &str) {
+    if !config::valid_value(key, v) {
+        ui.label(RichText::new(format!("config has '{v}'")).size(12.5).color(theme::RED))
+            .on_hover_text("frame refuses this value; pick a valid one before saving");
+    }
+}
+
+/// An on/off setting as a toggle (writes true/false).
+fn toggle_value(ui: &mut egui::Ui, key: &str, v: &mut String, label: &str) {
+    let mut b = config::yes(v);
+    if theme::toggle_label(ui, &mut b, label).changed() {
+        *v = b.to_string();
     }
     raw_note(ui, key, v);
 }
 
-/// One monitor from `clipped monitors` (NAME|WxH[|active]).
+/// A small filled circle in line with text.
+fn dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+/// The header pill, from the same pid files the tray reads.
+fn pill(live: &Status, tray: bool, rec_for: Option<std::time::Duration>) -> (Color32, String) {
+    if live.recording.is_some() {
+        return match rec_for {
+            Some(d) => (theme::RED, format!("Recording · {}:{:02}", d.as_secs() / 60, d.as_secs() % 60)),
+            None => (theme::RED, "Recording".into()),
+        };
+    }
+    match &live.replay {
+        Some(s) if !s.is_empty() => (theme::ACCENT, format!("Replay on · {s} s")),
+        Some(_) => (theme::ACCENT, "Replay on".into()),
+        None if live.daemon => (theme::TEXT_FAINT, "Replay off".into()),
+        None if tray => (theme::AMBER, "Starting…".into()),
+        None => (theme::TEXT_FAINT, "Not running".into()),
+    }
+}
+
+/// One monitor from `frame monitors` (NAME|WxH[|active]).
 #[derive(Clone, Debug, PartialEq)]
 struct Monitor {
     name: String,
@@ -911,26 +968,22 @@ fn source_options(current: &str, monitors: Option<&[Monitor]>, x11: bool) -> Vec
 
 fn source_combo(ui: &mut egui::Ui, v: &mut String, monitors: Option<&[Monitor]>, x11: bool) {
     let opts = source_options(v, monitors, x11);
-    let shown = opts.iter().find(|(val, _)| val == v).map_or(v.clone(), |o| o.1.clone());
-    ui.horizontal(|ui| {
-        egui::ComboBox::from_id_salt("video_source").width(220.0).selected_text(shown).show_ui(ui, |ui| {
-            for (val, label) in &opts {
-                ui.selectable_value(v, val.clone(), label);
-            }
-            let hint = match monitors {
-                None => Some("(looking for monitors…)"),
-                Some([]) => Some("(no monitors found)"),
-                Some(_) => None,
-            };
-            if let Some(h) = hint {
-                ui.label(RichText::new(h).weak());
-            }
-        });
-        if monitors.is_some_and(|m| m.is_empty()) {
-            ui.label(RichText::new("no monitors found").weak())
-                .on_hover_text("`clipped monitors` listed none: is gpu-screen-recorder installed?");
+    egui::ComboBox::from_id_salt("video_source").width(COMBO_WIDTH).selected_text(shown_label(v, &opts)).show_ui(ui, |ui| {
+        for (val, label) in &opts {
+            ui.selectable_value(v, val.clone(), label);
+        }
+        let hint = match monitors {
+            None => Some("(looking for monitors…)"),
+            Some([]) => Some("(no monitors found)"),
+            Some(_) => None,
+        };
+        if let Some(h) = hint {
+            ui.label(RichText::new(h).weak());
         }
     });
+    if monitors.is_some_and(|m| m.is_empty()) {
+        theme::hint(ui, "no monitors found").on_hover_text("`frame monitors` listed none: is gpu-screen-recorder installed?");
+    }
 }
 
 /// The daemon reads these only at start (the replay buffer keeps its monitor).
@@ -938,253 +991,390 @@ fn needs_daemon_restart(changes: &BTreeMap<String, String>) -> bool {
     changes.keys().any(|k| DAEMON_KEYS.contains(&k.as_str()))
 }
 
-fn text_with_menu(ui: &mut egui::Ui, v: &mut String, width: f32, options: &[String]) {
-    ui.add(egui::TextEdit::singleline(v).desired_width(width));
-    ui.menu_button("⏷", |ui| {
-        for o in options {
-            if ui.button(o).clicked() {
-                *v = o.clone();
-                ui.close();
-            }
+fn action_name(field: &str) -> &'static str {
+    ACTIONS.iter().zip(ACTION_NAMES).find(|(a, _)| **a == field).map_or("", |p| p.1)
+}
+
+impl App {
+    /// Re-read the pid files once a second for the header pill.
+    fn poll_live(&mut self, ctx: &egui::Context) {
+        let due = self.live_at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1));
+        if due {
+            let (proc_root, rundir) = (Path::new("/proc"), state::rundir());
+            let status = Status::read(proc_root, &rundir);
+            let rec_for = status.recording.as_ref().and_then(|_| {
+                let m = std::fs::metadata(rundir.join("record.pid")).and_then(|m| m.modified()).ok()?;
+                m.elapsed().ok()
+            });
+            self.live = (status, state::tray_running(proc_root, &rundir), rec_for);
+            self.live_at = Some(std::time::Instant::now());
         }
-    });
-}
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+    }
 
-fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(8.0);
-    ui.label(RichText::new(title).strong().size(15.0));
-    ui.separator();
-}
+    fn header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if let Some(tex) = &self.icon {
+                ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(36.0, 36.0)));
+            }
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(RichText::new("Frame").size(19.0).strong().color(theme::TEXT));
+                ui.label(RichText::new("Screenshots, replay and recording").size(12.5).color(theme::TEXT_MUTED));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (status, tray, rec_for) = &self.live;
+                let (color, text) = pill(status, *tray, *rec_for);
+                let tip = if !status.daemon && *tray {
+                    "The tray is starting the daemon; its menu says why if it can't.".to_string()
+                } else {
+                    status.tooltip()
+                };
+                theme::status_pill(ui, color, &text).on_hover_text(tip);
+            });
+        });
+    }
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_messages();
-        self.edit_keys(ctx);
-        self.self_shot(ctx);
-        let red = Color32::from_rgb(0xe0, 0x50, 0x50);
-
-        egui::TopBottomPanel::bottom("buttons").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.add_enabled(self.can_save(), egui::Button::new("Save")).clicked() {
+    fn bottom_bar(&mut self, ui: &mut egui::Ui) {
+        if !self.status.is_empty() {
+            let color = match () {
+                _ if self.error => theme::RED,
+                _ if self.status.starts_with("Saved.") => theme::GREEN,
+                _ => theme::TEXT_MUTED,
+            };
+            ui.add(egui::Label::new(RichText::new(&self.status).size(13.0).color(color)).wrap());
+            ui.add_space(4.0);
+        }
+        ui.horizontal(|ui| {
+            if self.dirty() {
+                dot(ui, theme::AMBER);
+                ui.label(RichText::new("Unsaved changes").color(theme::TEXT_MUTED));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled_ui(self.can_save(), |ui| theme::primary_button(ui, "Save")).inner.clicked() {
                     self.save();
                 }
                 let reload = self.read_error.is_some();
                 let label = if reload { "Reload" } else { "Revert" };
-                if ui.add_enabled(reload || self.dirty(), egui::Button::new(label)).clicked() {
+                if ui.add_enabled_ui(reload || self.dirty(), |ui| theme::secondary_button(ui, label)).inner.clicked() {
                     self.load();
                 }
                 if self.rebinding {
                     ui.spinner();
                 }
-                if self.offer_restart && ui.button("Restart service").clicked() {
-                    self.restart_service();
+            });
+        });
+    }
+
+    fn saving_card(&mut self, ui: &mut egui::Ui) {
+        theme::card(ui, "Saving", |ui| {
+            theme::row(ui, "Save folder", |ui| {
+                let w = (ui.available_width() - 112.0).max(120.0);
+                ui.add(egui::TextEdit::singleline(self.val("save_dir")).desired_width(w).margin(egui::vec2(8.0, 5.0)));
+                if theme::secondary_button(ui, "Browse…").clicked() {
+                    self.browse();
                 }
             });
-            let text = RichText::new(&self.status);
-            ui.add(egui::Label::new(if self.error { text.color(red) } else { text }).wrap());
-            ui.add_space(4.0);
+            if !state::expand_dir(&self.vals["save_dir"]).is_absolute() {
+                theme::row(ui, "", |ui| {
+                    ui.label(RichText::new("Must be an absolute path or start with ~/").size(12.5).color(theme::RED));
+                });
+            }
+            theme::row(ui, "Image format", |ui| choice_combo(ui, "image_format", self.val("image_format"), &choices(IMAGE_FORMATS)));
+            theme::row(ui, "Video format", |ui| choice_combo(ui, "video_format", self.val("video_format"), &choices(VIDEO_FORMATS)));
+            theme::row(ui, "After capture", |ui| toggle_value(ui, "clipboard", self.val("clipboard"), "Copy to clipboard"));
+            theme::row(ui, "", |ui| toggle_value(ui, "notify", self.val("notify"), "Notification with preview"));
         });
+    }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.label(RichText::new(format!("Config: {}", self.path.display())).small().weak());
-
-                section(ui, "Saving");
-                egui::Grid::new("saving").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                    ui.label("Save folder");
-                    ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(self.val("save_dir")).desired_width(260.0));
-                        if ui.button("Browse…").clicked() {
-                            self.browse();
+    fn video_card(&mut self, ui: &mut egui::Ui) {
+        theme::card(ui, "Video & replay", |ui| {
+            theme::row(ui, "Replay buffer", |ui| toggle_value(ui, "replay", self.val("replay"), "Always on while Frame runs"));
+            theme::row(ui, "Replay length", |ui| {
+                let v = self.val("replay_seconds");
+                let mut auto = v == "auto";
+                let mut n: u32 = v.parse().ok().filter(|n| (5..=1800).contains(n)).unwrap_or(60);
+                let drag = egui::DragValue::new(&mut n).range(5..=1800).suffix(" s");
+                if ui.add_enabled(!auto, drag).changed() {
+                    *v = n.to_string();
+                }
+                let r = theme::toggle_label(ui, &mut auto, "Auto (by free RAM)");
+                if r.on_hover_text("60 s with 8 GiB free RAM, else 30 s").changed() {
+                    *v = if auto { "auto".into() } else { "60".into() };
+                }
+                raw_note(ui, "replay_seconds", v);
+            });
+            theme::row(ui, "Source", |ui| {
+                let x11 = std::env::var("XDG_SESSION_TYPE").is_ok_and(|s| s == "x11");
+                let monitors = self.monitors.clone();
+                source_combo(ui, self.val("video_source"), monitors.as_deref(), x11);
+            });
+            theme::row(ui, "Frame rate", |ui| {
+                let opts = fps_choices(&self.vals["video_fps"]);
+                choice_combo(ui, "video_fps", self.val("video_fps"), &opts);
+            });
+            theme::row(ui, "Quality", |ui| choice_combo(ui, "video_quality", self.val("video_quality"), &choices(QUALITIES)));
+            theme::row(ui, "Codec", |ui| {
+                let webm = self.vals["video_format"] == "webm";
+                let v = self.val("video_codec");
+                choice_combo(ui, "video_codec", v, &choices(CODECS));
+                if webm && config::valid_value("video_codec", v) && !webm_codec(v) {
+                    ui.label(RichText::new("not for WebM").size(12.5).color(theme::RED))
+                        .on_hover_text(WEBM_CODECS);
+                }
+            });
+            theme::row(ui, "Audio", |ui| {
+                let v = self.vals.entry("audio".into()).or_default();
+                let preset = AUDIO.iter().find(|c| c.0 == v.as_str());
+                let custom = self.audio_custom || preset.is_none();
+                let shown = match preset {
+                    Some(c) if !custom => c.1,
+                    _ => "Custom…",
+                };
+                let mut pick = None;
+                let w = if custom { 150.0 } else { COMBO_WIDTH };
+                egui::ComboBox::from_id_salt("audio").width(w).selected_text(shown).show_ui(ui, |ui| {
+                    for (val, label) in AUDIO {
+                        if ui.selectable_label(!custom && v == val, *label).clicked() {
+                            *v = val.to_string();
+                            pick = Some(false);
                         }
-                    });
-                    ui.end_row();
-                    let dir = self.vals["save_dir"].clone();
-                    if !state::expand_dir(&dir).is_absolute() {
-                        ui.label("");
-                        ui.colored_label(red, "Must be an absolute path or start with ~/");
-                        ui.end_row();
                     }
-                    ui.label("Image format");
-                    combo_row(ui, "image_format", self.val("image_format"), &["png", "jpg", "webp"]);
-                    ui.end_row();
-                    ui.label("Video format");
-                    combo_row(ui, "video_format", self.val("video_format"), &["mp4", "webm", "mkv"]);
-                    ui.end_row();
-                    ui.label("");
-                    ui.vertical(|ui| {
-                        checkbox(ui, "clipboard", self.val("clipboard"), "Copy to clipboard");
-                        checkbox(ui, "notify", self.val("notify"), "Notification with preview");
-                    });
-                    ui.end_row();
+                    if ui.selectable_label(custom, "Custom…").clicked() {
+                        pick = Some(true);
+                    }
                 });
+                if custom {
+                    ui.add(
+                        egui::TextEdit::singleline(v)
+                            .desired_width(ui.available_width().min(200.0))
+                            .margin(egui::vec2(8.0, 5.0))
+                            .hint_text("gpu-screen-recorder -a"),
+                    );
+                    if v.trim().is_empty() {
+                        theme::hint(ui, "empty = no audio");
+                    }
+                }
+                if let Some(c) = pick {
+                    self.audio_custom = c;
+                }
+            });
+        });
+    }
 
-                section(ui, "Video");
-                egui::Grid::new("video").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                    ui.label("");
-                    checkbox(ui, "replay", self.val("replay"), "Keep a replay buffer running");
-                    ui.end_row();
-                    ui.label("Replay length");
-                    ui.horizontal(|ui| {
-                        let v = self.val("replay_seconds");
-                        let mut auto = v == "auto";
-                        if ui.checkbox(&mut auto, "Auto").changed() {
-                            *v = if auto { "auto".into() } else { "60".into() };
-                        }
-                        if !auto {
-                            number(ui, "replay_seconds", v, 5..=1800, 60, " s");
-                        } else {
-                            ui.label(RichText::new("60 s with 8 GiB free RAM, else 30 s").weak());
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Source");
-                    let x11 = std::env::var("XDG_SESSION_TYPE").is_ok_and(|s| s == "x11");
-                    let monitors = self.monitors.clone();
-                    source_combo(ui, self.val("video_source"), monitors.as_deref(), x11);
-                    ui.end_row();
-                    ui.label("Frame rate");
-                    ui.horizontal(|ui| number(ui, "video_fps", self.val("video_fps"), 1..=240, 60, " fps"));
-                    ui.end_row();
-                    ui.label("Quality");
-                    combo_row(ui, "video_quality", self.val("video_quality"), &["medium", "high", "very_high", "ultra"]);
-                    ui.end_row();
-                    ui.label("Codec");
-                    combo_row(ui, "video_codec", self.val("video_codec"), &[
-                        "auto", "h264", "hevc", "av1", "vp8", "vp9", "hevc_hdr", "av1_hdr", "hevc_10bit", "av1_10bit",
-                    ]);
-                    ui.end_row();
-                    ui.label("Audio");
-                    let opts = ["default_output", "default_input", "none"].map(String::from);
-                    text_with_menu(ui, self.val("audio"), 180.0, &opts);
-                    ui.end_row();
+    fn shortcuts_card(&mut self, ui: &mut egui::Ui) {
+        let can_record = self.keys.is_some();
+        theme::card(ui, "Shortcuts", |ui| {
+            if self.shortcuts_inactive() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Shortcuts are not active.").color(theme::RED));
+                    if theme::primary_button(ui, "Turn on shortcuts").clicked() {
+                        self.set_status(UPDATING.into(), false);
+                        self.rebind();
+                    }
                 });
-
-                section(ui, "Shortcuts");
-                egui::Grid::new("binds").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                    for (a, name) in ACTIONS.iter().zip(ACTION_NAMES) {
-                        let key = format!("bind.{a}");
-                        ui.label(name);
-                        ui.horizontal(|ui| {
-                            let v = self.vals.entry(key.clone()).or_default();
-                            ui.add(egui::TextEdit::singleline(v).desired_width(150.0).hint_text("none"));
-                            let open = self.editor.as_ref().is_some_and(|e| e.field == *a);
-                            let label = if v.is_empty() { "Set…" } else { "Change" };
-                            let r = ui.add(egui::Button::new(label).selected(open));
-                            if r.clicked() {
-                                self.editor = (!open).then(|| Editor { field: a, sc: Shortcut::parse(v), rec: None });
-                                r.surrender_focus();
-                            }
-                            if ui.button("Clear").clicked() {
-                                self.vals.insert(key.clone(), String::new());
-                            }
-                            let v = &self.vals[&key];
-                            if !v.is_empty() && !config::valid_shortcut(v) {
-                                ui.colored_label(red, "not a shortcut");
-                            }
+                ui.add_space(2.0);
+            }
+            for (a, name) in ACTIONS.iter().zip(ACTION_NAMES) {
+                let key = format!("bind.{a}");
+                let v = self.vals.get(&key).cloned().unwrap_or_default();
+                theme::row(ui, name, |ui| {
+                    if v.is_empty() || config::valid_shortcut(&v) {
+                        theme::keycaps(ui, &v, KEYCAPS_WIDTH);
+                    } else {
+                        let h = ui.spacing().interact_size.y;
+                        let layout = egui::Layout::left_to_right(egui::Align::Center);
+                        ui.allocate_ui_with_layout(egui::vec2(KEYCAPS_WIDTH, h), layout, |ui| {
+                            ui.set_min_width(KEYCAPS_WIDTH);
+                            ui.add(egui::Label::new(RichText::new(format!("'{v}'")).color(theme::RED)).truncate())
+                                .on_hover_text(format!("config has '{v}': not a shortcut"));
                         });
-                        ui.end_row();
+                    }
+                    let r = theme::secondary_button(ui, "Record")
+                        .on_hover_text("Press the shortcut on the keyboard, or build it from Meta/Ctrl/Alt/Shift + a key");
+                    if r.clicked() {
+                        let rec = can_record.then(Recorder::default);
+                        self.editor = Some(Editor { field: a, sc: Shortcut::parse(&v), rec, cancel: None });
+                        r.surrender_focus();
+                    }
+                    if ui.add_enabled_ui(!v.is_empty(), |ui| theme::secondary_button(ui, "Clear")).inner.clicked() {
+                        self.vals.insert(key.clone(), String::new());
                     }
                 });
-                let can_record = self.keys.is_some();
-                if let Some(ed) = self.editor.as_mut() {
-                    let (mut set, mut close) = (None, false);
-                    ui.add_space(4.0);
-                    ui.group(|ui| {
-                        let name = ACTIONS.iter().zip(ACTION_NAMES).find(|(a, _)| **a == ed.field).map_or("", |p| p.1);
-                        ui.label(RichText::new(format!("Shortcut for {name}")).strong());
+            }
+            theme::hint(ui, "Up to three keys: Meta, Ctrl, Alt, Shift + one key (A–Z, 0–9, F1–F35, Print, Space, Home…).");
+        });
+    }
+
+    fn startup_card(&mut self, ui: &mut egui::Ui) {
+        theme::card(ui, "Startup", |ui| {
+            theme::row(ui, "At login", |ui| {
+                theme::toggle_label(ui, &mut self.autostart, "Start Frame (tray + replay)")
+                    .on_hover_text("Starts the tray, which keeps the shortcuts and the replay buffer running");
+            });
+            theme::hint(ui, "Frame comes back with your saved settings and replay buffer.");
+        });
+    }
+
+    /// The shortcut editor as a modal dialog: Record (KeyTap, up to 3
+    /// keys, Stop / Esc), or Meta/Ctrl/Alt/Shift + a key from the list; Set
+    /// writes the field, Cancel (or a click outside) leaves it.
+    fn editor_dialog(&mut self, ctx: &egui::Context) {
+        let can_record = self.keys.is_some();
+        let Some(ed) = self.editor.as_mut() else { return };
+        let (mut set, mut close) = (None, false);
+        let frame = egui::Frame::new()
+            .fill(theme::CARD)
+            .stroke(egui::Stroke::new(1.0_f32, theme::BORDER_STRONG))
+            .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS))
+            .inner_margin(egui::Margin::same(20))
+            .shadow(ctx.style().visuals.window_shadow);
+        let modal = egui::Modal::new(egui::Id::new("shortcut-editor"))
+            .frame(frame)
+            .backdrop_color(Color32::from_black_alpha(150))
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.label(RichText::new(format!("Shortcut for {}", action_name(ed.field))).size(17.0).strong().color(theme::TEXT));
+                theme::hint(ui, "Press it on the keyboard, or build it below.");
+                ui.add_space(6.0);
+
+                // The shortcut so far, as keycaps.
+                egui::Frame::new()
+                    .fill(theme::FIELD)
+                    .stroke(egui::Stroke::new(1.0_f32, if ed.rec.is_some() { theme::ACCENT } else { theme::BORDER }))
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS))
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
                         ui.horizontal(|ui| match &ed.rec {
                             Some(rec) => {
-                                let so_far = rec.shortcut().text();
-                                let shown = if rec.combo.is_empty() { "Press up to 3 keys…".to_string() } else { so_far };
                                 ui.spinner();
-                                ui.label(RichText::new(shown).monospace().strong());
-                                let refused = rec.refused;
-                                let got = (!rec.combo.is_empty()).then(|| rec.shortcut());
-                                if ui.button("Stop").clicked() {
-                                    ed.sc = got.unwrap_or(std::mem::take(&mut ed.sc));
-                                    ed.rec = None;
+                                if rec.combo.is_empty() {
+                                    ui.label(RichText::new("Press up to 3 keys…").color(theme::TEXT_MUTED));
+                                } else {
+                                    theme::keycaps(ui, &rec.shortcut().text(), 200.0);
                                 }
-                                if refused {
-                                    ui.colored_label(red, "that key can't be a shortcut");
-                                }
+                            }
+                            None if ed.sc.key.is_empty() => {
+                                ui.label(RichText::new("Pick a key").italics().color(theme::TEXT_FAINT));
                             }
                             None => {
-                                let r = ui
-                                    .add_enabled(can_record, egui::Button::new("⏺ Record"))
-                                    .on_hover_text("Press the shortcut on the keyboard")
-                                    .on_disabled_hover_text("Key capture isn't available here; use the boxes below");
-                                if r.clicked() {
-                                    ed.rec = Some(Recorder::default());
-                                    r.surrender_focus();
-                                }
+                                theme::keycaps(ui, &ed.sc.text(), 200.0);
                             }
                         });
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut ed.sc.meta, "Meta");
-                            ui.checkbox(&mut ed.sc.ctrl, "Ctrl");
-                            ui.checkbox(&mut ed.sc.alt, "Alt");
-                            ui.checkbox(&mut ed.sc.shift, "Shift");
-                            ui.label("+");
-                            let shown = if ed.sc.key.is_empty() { "key…" } else { ed.sc.key.as_str() };
-                            egui::ComboBox::from_id_salt("shortcut-key").selected_text(shown.to_string()).show_ui(ui, |ui| {
-                                for k in key_choices() {
-                                    ui.selectable_value(&mut ed.sc.key, k.clone(), k);
-                                }
-                            });
-                        });
-                        ui.horizontal(|ui| {
-                            let text = ed.sc.text();
-                            if ed.sc.key.is_empty() {
-                                ui.label(RichText::new("Pick a key").weak());
-                            } else {
-                                ui.label(RichText::new(&text).monospace().strong());
-                            }
-                            if ui.add_enabled(!ed.sc.key.is_empty(), egui::Button::new("Set")).clicked() {
-                                set = Some(text);
-                            }
-                            if ui.button("Cancel").clicked() {
-                                close = true;
-                            }
-                        });
-                        ui.label(
-                            RichText::new(
-                                "Record takes up to 3 keys and stops when you let go (Stop ends it sooner; Esc \
-                                 cancels). Combos KDE already uses, like the current Meta+Print, go to KDE \
-                                 first: press Stop and pick the key above. 4-key shortcuts: use the boxes.",
-                            )
-                            .small()
-                            .weak(),
-                        );
                     });
-                    if let Some(v) = set {
-                        self.vals.insert(format!("bind.{}", ed.field), v);
-                        close = true;
-                    }
-                    if close {
-                        self.editor = None;
-                    }
+                if ed.rec.as_ref().is_some_and(|r| r.refused) {
+                    ui.label(RichText::new("That key can't be a shortcut.").size(12.5).color(theme::RED));
                 }
-                ui.label(
-                    RichText::new("Meta, Ctrl, Alt, Shift + one key (A–Z, 0–9, F1–F35, Print, Space, Home…).")
-                        .small()
-                        .weak(),
-                );
-                if self.shortcuts_inactive() {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(red, "Shortcuts are not active.");
-                        if ui.button("Turn on shortcuts").clicked() {
-                            self.set_status(UPDATING.into(), false);
-                            self.rebind();
+                ui.add_space(2.0);
+                ui.horizontal(|ui| match &ed.rec {
+                    Some(rec) => {
+                        let got = (!rec.combo.is_empty()).then(|| rec.shortcut());
+                        if theme::primary_button(ui, "Stop").clicked() {
+                            ed.sc = got.unwrap_or(std::mem::take(&mut ed.sc));
+                            ed.rec = None;
+                        }
+                        theme::hint(ui, "Esc cancels");
+                    }
+                    None => {
+                        let r = ui
+                            .add_enabled_ui(can_record, |ui| theme::secondary_button(ui, "⏺ Record"))
+                            .inner
+                            .on_hover_text("Press the shortcut on the keyboard")
+                            .on_disabled_hover_text("Key capture isn't available here; use the keys below");
+                        if r.clicked() {
+                            ed.rec = Some(Recorder::default());
+                            r.surrender_focus();
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+                theme::section_header(ui, "Or pick the keys");
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for (on, name) in [(&mut ed.sc.meta, "Meta"), (&mut ed.sc.ctrl, "Ctrl"), (&mut ed.sc.alt, "Alt"), (&mut ed.sc.shift, "Shift")] {
+                        if ui.add(egui::Button::new(name).selected(*on).min_size(egui::vec2(52.0, 30.0))).clicked() {
+                            *on = !*on;
+                        }
+                    }
+                    ui.label(RichText::new("+").color(theme::TEXT_MUTED));
+                    let shown = if ed.sc.key.is_empty() { "key…" } else { ed.sc.key.as_str() };
+                    egui::ComboBox::from_id_salt("shortcut-key").width(96.0).selected_text(shown.to_string()).show_ui(ui, |ui| {
+                        for k in key_choices() {
+                            ui.selectable_value(&mut ed.sc.key, k.clone(), k);
                         }
                     });
-                }
+                });
+                ui.add_space(4.0);
+                theme::hint(
+                    ui,
+                    "Record takes up to 3 keys and stops when you let go. Keys KDE already uses go to KDE \
+                     first: press Stop and pick them above, as for 4-key shortcuts.",
+                );
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let text = ed.sc.text();
+                    if ui.add_enabled_ui(!ed.sc.key.is_empty(), |ui| theme::primary_button(ui, "Set")).inner.clicked() {
+                        set = Some(text);
+                    }
+                    let r = theme::secondary_button(ui, "Cancel");
+                    ed.cancel = Some(r.id);
+                    if r.clicked() {
+                        close = true;
+                    }
+                });
+            });
+        // A click outside (or Esc, also handled in edit_keys) cancels, but
+        // never while Record listens.
+        if ed.rec.is_none() && modal.should_close() {
+            close = true;
+        }
+        if let Some(v) = set {
+            self.vals.insert(format!("bind.{}", ed.field), v);
+            close = true;
+        }
+        if close {
+            self.editor = None;
+        }
+    }
+}
 
-                section(ui, "Tray");
-                ui.checkbox(&mut self.autostart, "Start tray at login");
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_messages();
+        self.poll_live(ctx);
+        self.edit_keys(ctx);
+        self.self_shot(ctx);
+
+        egui::TopBottomPanel::top("header")
+            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin { left: 18, right: 16, top: 14, bottom: 6 }))
+            .show_separator_line(false)
+            .show(ctx, |ui| self.header(ui));
+
+        egui::TopBottomPanel::bottom("buttons")
+            .frame(theme::bottom_bar_frame())
+            .show_separator_line(false)
+            .show(ctx, |ui| self.bottom_bar(ui));
+
+        egui::CentralPanel::default().frame(theme::page_frame()).show(ctx, |ui| {
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                self.saving_card(ui);
+                ui.add_space(4.0); // + item spacing = 12 px between cards
+                self.video_card(ui);
+                ui.add_space(4.0);
+                self.shortcuts_card(ui);
+                ui.add_space(4.0);
+                self.startup_card(ui);
+                ui.add_space(8.0);
+                theme::hint(ui, format!("Config: {}", self.path.display()));
+                if self.shot_end {
+                    ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                }
             });
         });
+
+        self.editor_dialog(ctx);
     }
 }
 
@@ -1194,21 +1384,9 @@ mod tests {
 
     #[test]
     fn exec_quoting_matches_bash() {
-        assert_eq!(desktop_exec_arg("/home/u/.local/bin/clipped-gui"), "/home/u/.local/bin/clipped-gui");
+        assert_eq!(desktop_exec_arg("/home/u/.local/bin/frame-gui"), "/home/u/.local/bin/frame-gui");
         // Same expectation as the "quoting helpers" check in tests/smoke.sh.
         assert_eq!(desktop_exec_arg("/a b/$x%\"q\\"), "\"/a b/\\\\$x%%\\\\\"q\\\\\\\\\"");
-    }
-
-    #[test]
-    fn key_names() {
-        assert_eq!(key_name(egui::Key::R).as_deref(), Some("R"));
-        assert_eq!(key_name(egui::Key::Num5).as_deref(), Some("5"));
-        assert_eq!(key_name(egui::Key::F12).as_deref(), Some("F12"));
-        assert_eq!(key_name(egui::Key::PageUp).as_deref(), Some("PgUp"));
-        assert_eq!(key_name(egui::Key::Comma), None);
-        for k in ["R", "5", "F12", "PgUp", "Space", "Return", "Del"] {
-            assert!(config::valid_shortcut(&format!("Meta+{k}")), "{k}");
-        }
     }
 
     #[test]
@@ -1229,19 +1407,15 @@ mod tests {
         assert_eq!(sc(false, false, false, false, "Print").text(), "Print");
     }
 
-    /// Every key the editor offers is one clipped accepts, Print first.
+    /// Every key the editor offers is one frame accepts, Print first.
     #[test]
-    fn key_choices_match_clipped() {
+    fn key_choices_match_frame() {
         let keys = key_choices();
         assert_eq!(keys[0], "Print");
         assert!(keys.contains(&"F24".into()) && keys.contains(&"Z".into()) && keys.contains(&"9".into()));
         for k in &keys {
             assert!(config::valid_shortcut(&format!("Meta+{k}")), "{k}");
             assert_eq!(canonical_key(&k.to_ascii_lowercase()).as_deref(), Some(k.as_str()));
-        }
-        // Keys egui reports land on an entry of the list.
-        for k in [egui::Key::Escape, egui::Key::Enter, egui::Key::Insert, egui::Key::PageDown, egui::Key::F12, egui::Key::Num0] {
-            assert!(keys.contains(&key_name(k).unwrap()), "{k:?}");
         }
     }
 
@@ -1259,8 +1433,8 @@ mod tests {
         (format!("…{}", r.shortcut().text()), r)
     }
 
-    /// The combos Record finishes on (each also checked by `clipped check`
-    /// in record_output_passes_clipped_check).
+    /// The combos Record finishes on (each also checked by `frame check`
+    /// in record_output_passes_frame_check).
     fn recorded_combos() -> Vec<(Vec<KeyEv>, &'static str)> {
         use KeyEv::{Down, Up};
         use Part::*;
@@ -1277,7 +1451,7 @@ mod tests {
             (vec![Down(Alt), Down(Ctrl), Up(Alt)], "…Ctrl+Alt"),
             // Letting go of a modifier first also ends it.
             (vec![Down(Alt), Down(k("S")), Up(Alt)], "Alt+S"),
-            // A second key replaces the first (clipped takes one).
+            // A second key replaces the first (frame takes one).
             (vec![Down(Ctrl), Down(k("A")), Down(k("B")), Up(k("B"))], "Ctrl+B"),
             // Esc with a modifier is a shortcut; alone it cancels.
             (vec![Down(Ctrl), Down(k("Esc")), Up(k("Esc"))], "Ctrl+Esc"),
@@ -1307,7 +1481,7 @@ mod tests {
         assert_eq!(record(&[Down(Meta), Down(Meta), Down(Key("V".into())), Up(Key("V".into()))]).0, "Meta+V");
         // Focus lost: held keys are forgotten, the next press starts over.
         assert_eq!(record(&[Down(Meta), Reset, Down(Key("P".into())), Up(Key("P".into()))]).0, "P");
-        // A key clipped can't bind is flagged and not taken.
+        // A key frame can't bind is flagged and not taken.
         let (text, r) = record(&[Down(Ctrl), Other]);
         assert_eq!(text, "…Ctrl");
         assert!(r.refused);
@@ -1315,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn winit_keys_map_to_clipped_names() {
+    fn winit_keys_map_to_frame_names() {
         use winit::keyboard::{Key, NamedKey as N};
         let name = |k: Key| match winit_part(&k) {
             Some(Part::Key(s)) => s,
@@ -1337,13 +1511,13 @@ mod tests {
         }
     }
 
-    /// Everything Record can finish with is a value `clipped check` accepts.
+    /// Everything Record can finish with is a value `frame check` accepts.
     #[test]
-    fn record_output_passes_clipped_check() {
-        let Some(clipped) = clip_script() else { return };
+    fn record_output_passes_frame_check() {
+        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("rec");
-        test_env(&d, &clipped);
+        test_env(&d, &frame);
         let cfg = d.join("config");
         for (evs, want) in recorded_combos() {
             if want.starts_with(['-', '…']) {
@@ -1357,14 +1531,111 @@ mod tests {
         }
     }
 
+    /// The WebM codec note follows bin/frame's rule for every pair.
+    #[test]
+    fn webm_codec_rule_matches_frame() {
+        let Some(frame) = clip_script() else { return };
+        let _env = crate::testutil::env_lock();
+        let d = crate::testutil::tempdir("webm");
+        test_env(&d, &frame);
+        let cfg = d.join("config");
+        for (f, _) in VIDEO_FORMATS {
+            for (c, _) in CODECS {
+                std::fs::write(&cfg, format!("video_format = {f}\nvideo_codec = {c}\n")).unwrap();
+                let ok = run_clip(&["check"], Some(&cfg)).unwrap().status.success();
+                assert_eq!(ok, *f != "webm" || webm_codec(c), "{f} + {c}");
+            }
+        }
+    }
+
+    /// WebM + HEVC is refused before frame sees it; an emptied Custom…
+    /// audio field saves `none`.
+    #[test]
+    fn webm_codec_and_empty_audio_on_save() {
+        let Some(frame) = clip_script() else { return };
+        let _env = crate::testutil::env_lock();
+        let d = crate::testutil::tempdir("webmsave");
+        test_env(&d, &frame);
+        let cfg = d.join("cfg/frame/config");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(d.join("state/frame")).unwrap();
+        std::fs::write(d.join("state/frame/binds"), "").unwrap();
+        std::fs::write(&cfg, "video_codec = hevc\naudio = default_output\n").unwrap();
+        let mut app = app_at(&cfg);
+        app.vals.insert("video_format".into(), "webm".into());
+        app.save();
+        assert!(app.error && app.status.contains("WebM needs codec"), "{}", app.status);
+        app.vals.insert("video_codec".into(), "vp9".into());
+        app.audio_custom = true;
+        app.vals.insert("audio".into(), "  ".into());
+        app.save();
+        assert!(!app.error, "{}", app.status);
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("audio = none") && text.contains("video_codec = vp9"), "{text}");
+        wait_rebind(&mut app);
+    }
+
+    /// Outside Record, keys never change the shortcut; Enter means Set
+    /// (not while Cancel has focus).
+    #[test]
+    fn editor_keys_dont_overwrite() {
+        let _env = crate::testutil::env_lock();
+        let d = crate::testutil::tempdir("edkeys");
+        test_env(&d, Path::new("/nonexistent"));
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx);
+        app.path = d.join("config");
+        app.load();
+        let press = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        let frame = |app: &mut App, events: Vec<egui::Event>, focus: bool| {
+            let input = egui::RawInput { events, ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                if focus {
+                    if let Some(id) = app.editor.as_ref().and_then(|e| e.cancel) {
+                        ctx.memory_mut(|m| m.request_focus(id));
+                    }
+                }
+                app.edit_keys(ctx);
+                app.editor_dialog(ctx);
+            });
+        };
+        let open = |app: &mut App| app.editor = Some(Editor { field: "region", sc: Shortcut::parse("Meta+Alt+R"), rec: None, cancel: None });
+        open(&mut app);
+        frame(&mut app, vec![press(egui::Key::Tab), press(egui::Key::ArrowDown), press(egui::Key::F5)], false);
+        assert_eq!(app.editor.as_ref().map(|e| e.sc.text()).as_deref(), Some("Meta+Alt+R"));
+        // Enter while Cancel has focus: no Set.
+        frame(&mut app, vec![], true);
+        frame(&mut app, vec![press(egui::Key::Enter)], false);
+        assert_eq!(app.vals["bind.region"], config::DEFAULTS.iter().find(|d| d.0 == "bind.region").unwrap().1);
+        // Enter with nothing focused: Set, key unchanged.
+        open(&mut app);
+        frame(&mut app, vec![], false);
+        frame(&mut app, vec![press(egui::Key::Enter)], false);
+        assert!(app.editor.is_none());
+        assert_eq!(app.vals["bind.region"], "Meta+Alt+R");
+        // Esc cancels.
+        open(&mut app);
+        app.vals.insert("bind.region".into(), String::new());
+        frame(&mut app, vec![press(egui::Key::Escape)], false);
+        frame(&mut app, vec![], false);
+        assert!(app.editor.is_none());
+        assert_eq!(app.vals["bind.region"], "");
+    }
+
     #[test]
     fn autostart_entry_validates() {
         let d = crate::testutil::tempdir("auto");
-        let f = d.join("clipped-gui.desktop");
-        std::fs::write(&f, autostart_entry("/opt/my clipped/clipped-gui")).unwrap();
+        let f = d.join("frame-gui.desktop");
+        std::fs::write(&f, autostart_entry("/opt/my frame/frame-gui")).unwrap();
         let text = std::fs::read_to_string(&f).unwrap();
-        assert!(text.contains("Exec=\"/opt/my clipped/clipped-gui\"\n"), "{text}");
+        assert!(text.contains("Exec=\"/opt/my frame/frame-gui\"\n"), "{text}");
         assert!(text.contains("X-GNOME-Autostart-enabled=true"));
+        // install.sh writes the same text (tests/smoke.sh checks its copy).
+        assert_eq!(
+            autostart_entry("/p/frame-gui"),
+            "[Desktop Entry]\nType=Application\nName=Frame\nComment=Frame tray: shortcuts and replay buffer\n\
+             Exec=/p/frame-gui\nIcon=frame\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+        );
         if let Ok(o) = Command::new("desktop-file-validate").arg(&f).output() {
             assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
         }
@@ -1398,7 +1669,43 @@ mod tests {
     }
 
     #[test]
-    fn video_source_change_offers_restart() {
+    fn friendly_labels_keep_config_values() {
+        let fps = |cur: &str| fps_choices(cur).into_iter().map(|o| o.0).collect::<Vec<_>>();
+        assert_eq!(fps("60"), ["24", "30", "48", "60", "75", "90", "120", "144", "240"]);
+        // A valid unlisted rate is offered in order; an invalid one isn't.
+        assert_eq!(fps("100")[6], "100");
+        assert_eq!(fps("fast").len(), FPS.len());
+        assert_eq!(shown_label("very_high", &choices(QUALITIES)), "Very high");
+        assert_eq!(shown_label("fast", &fps_choices("fast")), "fast");
+        assert_eq!(shown_label("", &choices(IMAGE_FORMATS)), "(empty)");
+        for (k, list) in [("image_format", IMAGE_FORMATS), ("video_format", VIDEO_FORMATS), ("video_quality", QUALITIES), ("video_codec", CODECS)] {
+            for (v, _) in list {
+                assert!(config::valid_value(k, v), "{k} = {v}");
+            }
+        }
+        for (v, _) in AUDIO {
+            assert_eq!(config::unrepresentable(v), None, "{v}");
+        }
+    }
+
+    #[test]
+    fn header_pill() {
+        let s = |rec: bool, replay: Option<&str>, daemon| Status {
+            recording: rec.then(|| "/v/a.mp4".into()),
+            replay: replay.map(String::from),
+            daemon,
+        };
+        let text = |st: Status, tray, d| pill(&st, tray, d).1;
+        assert_eq!(text(s(true, Some("60"), true), true, Some(std::time::Duration::from_secs(62))), "Recording · 1:02");
+        assert_eq!(text(s(false, Some("60"), true), true, None), "Replay on · 60 s");
+        assert_eq!(pill(&s(false, Some("60"), true), true, None).0, theme::ACCENT);
+        assert_eq!(text(s(false, None, true), true, None), "Replay off");
+        assert_eq!(text(s(false, None, false), true, None), "Starting…");
+        assert_eq!(text(s(false, None, false), false, None), "Not running");
+    }
+
+    #[test]
+    fn daemon_settings_need_a_restart() {
         let ch = |k: &str| BTreeMap::from([(k.to_string(), "x".to_string())]);
         assert!(needs_daemon_restart(&ch("video_source")));
         assert!(needs_daemon_restart(&ch("replay_seconds")));
@@ -1407,26 +1714,26 @@ mod tests {
     }
 
     fn clip_script() -> Option<PathBuf> {
-        let clipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../bin/clipped");
-        clipped.exists().then_some(clipped)
+        let frame = Path::new(env!("CARGO_MANIFEST_DIR")).join("../bin/frame");
+        frame.exists().then_some(frame)
     }
 
-    /// Temp XDG dirs, dry-run clipped and a desktop with no shortcut backend,
-    /// so nothing here can touch the real session. CLIPPED_BIN logs each call
-    /// to D/calls, then runs bin/clipped.
-    fn test_env(d: &Path, clipped: &Path) {
+    /// Temp XDG dirs, dry-run frame and a desktop with no shortcut backend,
+    /// so nothing here can touch the real session. FRAME_BIN logs each call
+    /// to D/calls, then runs bin/frame.
+    fn test_env(d: &Path, frame: &Path) {
         for (k, sub) in [("XDG_CONFIG_HOME", "cfg"), ("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"), ("XDG_CACHE_HOME", "cache")] {
             std::fs::create_dir_all(d.join(sub)).unwrap();
             std::env::set_var(k, d.join(sub));
         }
-        let wrap = d.join("clipped-wrap");
-        std::fs::write(&wrap, format!("#!/bin/sh\necho \"$*\" >>'{}/calls'\nexec '{}' \"$@\"\n", d.display(), clipped.display())).unwrap();
+        let wrap = d.join("frame-wrap");
+        std::fs::write(&wrap, format!("#!/bin/sh\necho \"$*\" >>'{}/calls'\nexec '{}' \"$@\"\n", d.display(), frame.display())).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&wrap, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::env::set_var("CLIPPED_BIN", &wrap);
-        std::env::set_var("CLIPPED_DRY_RUN", "1");
-        std::env::set_var("XDG_CURRENT_DESKTOP", "clipped-test");
-        std::env::remove_var("CLIPPED_CONFIG");
+        std::env::set_var("FRAME_BIN", &wrap);
+        std::env::set_var("FRAME_DRY_RUN", "1");
+        std::env::set_var("XDG_CURRENT_DESKTOP", "frame-test");
+        std::env::remove_var("FRAME_CONFIG");
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
         std::env::remove_var("SWAYSOCK");
     }
@@ -1439,7 +1746,7 @@ mod tests {
     }
 
     /// Also called before a test ends: a bind thread outliving env_lock
-    /// would run under the next test's CLIPPED_BIN.
+    /// would run under the next test's FRAME_BIN.
     fn wait_rebind(app: &mut App) {
         for _ in 0..200 {
             app.poll_messages();
@@ -1448,7 +1755,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        panic!("clipped bind never reported: {}", app.status);
+        panic!("frame bind never reported: {}", app.status);
     }
 
     /// Nova #1: a config we can't read (EACCES, or unreadable by the time
@@ -1456,11 +1763,11 @@ mod tests {
     #[test]
     fn unreadable_config_is_never_replaced() {
         use std::os::unix::fs::PermissionsExt;
-        let Some(clipped) = clip_script() else { return };
+        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("unread");
-        test_env(&d, &clipped);
-        let cfg = d.join("cfg/clipped/config");
+        test_env(&d, &frame);
+        let cfg = d.join("cfg/frame/config");
         std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
         let mine = "# mine\nvideo_fps = 30\n";
         std::fs::write(&cfg, mine).unwrap();
@@ -1494,10 +1801,10 @@ mod tests {
     /// Save keeps every other byte.
     #[test]
     fn non_utf8_config_is_edited_in_place() {
-        let Some(clipped) = clip_script() else { return };
+        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("latin1");
-        test_env(&d, &clipped);
+        test_env(&d, &frame);
         let cfg = d.join("config");
         std::fs::write(&cfg, b"# caf\xe9\r\nvideo_fps = 30   # \xe9\nimage_format = png\n").unwrap();
         let mut app = app_at(&cfg);
@@ -1515,14 +1822,14 @@ mod tests {
     /// The Save button end to end, headless, in temp XDG dirs.
     #[test]
     fn save_flow() {
-        let Some(clipped) = clip_script() else { return };
+        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("save");
-        test_env(&d, &clipped);
-        let mut app = app_at(&d.join("cfg/clipped/config"));
+        test_env(&d, &frame);
+        let mut app = app_at(&d.join("cfg/frame/config"));
         assert!(app.status.contains("No config file yet"));
 
-        // New file: clipped's template plus the changes, then `clipped bind`.
+        // New file: frame's template plus the changes, then `frame bind`.
         // Text fields are trimmed.
         app.vals.insert("image_format".into(), "jpg".into());
         app.vals.insert("bind.window".into(), String::new());
@@ -1533,19 +1840,19 @@ mod tests {
         wait_rebind(&mut app);
         assert!(app.status.starts_with("Saved. Shortcuts updated"), "{}", app.status);
         let text = std::fs::read_to_string(&app.path).unwrap();
-        assert!(text.starts_with("# clipped config"), "{text}");
+        assert!(text.starts_with("# frame config"), "{text}");
         assert!(text.contains("\nimage_format = jpg         # png | jpg | webp\n"), "{text}");
         assert!(text.contains("\nbind.window =\n"), "{text}");
         assert!(text.contains("\nvideo_source = DP-1        # auto"), "{text}");
         assert!(!app.dirty());
 
-        // clipped check refuses: file untouched, error shown.
+        // frame check refuses: file untouched, error shown.
         app.vals.insert("video_fps".into(), "999".into());
         app.save();
         assert!(app.error && app.status.contains("video_fps must be 1-240"), "{}", app.status);
         assert_eq!(std::fs::read_to_string(&app.path).unwrap(), text);
 
-        // Refused before clipped sees it.
+        // Refused before frame sees it.
         app.load();
         app.vals.insert("audio".into(), "a #b".into());
         app.save();
@@ -1561,7 +1868,7 @@ mod tests {
         app.autostart = true;
         app.save();
         wait_rebind(&mut app);
-        let auto = d.join("cfg/autostart/clipped-gui.desktop");
+        let auto = d.join("cfg/autostart/frame-gui.desktop");
         assert!(std::fs::read_to_string(&auto).unwrap().contains("X-GNOME-Autostart-enabled=true"));
         app.autostart = false;
         app.save();
@@ -1569,14 +1876,14 @@ mod tests {
         assert!(!auto.exists() && !app.error, "{}", app.status);
     }
 
-    /// Kevin's case: installed, never bound. Any Save runs `clipped bind`;
-    /// once clipped has bound, a Save without bind.* changes doesn't.
+    /// Kevin's case: installed, never bound. Any Save runs `frame bind`;
+    /// once frame has bound, a Save without bind.* changes doesn't.
     #[test]
     fn first_save_binds() {
-        let Some(clipped) = clip_script() else { return };
+        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("firstbind");
-        test_env(&d, &clipped);
+        test_env(&d, &frame);
         let cfg = d.join("config");
         std::fs::write(&cfg, "image_format = png\n").unwrap();
         let mut app = app_at(&cfg);
@@ -1588,8 +1895,8 @@ mod tests {
         wait_rebind(&mut app);
         assert!(!app.error && app.status.starts_with("Saved. Shortcuts updated"), "{}", app.status);
 
-        std::fs::create_dir_all(d.join("state/clipped")).unwrap();
-        std::fs::write(d.join("state/clipped/binds"), "kde region Meta+Print\n").unwrap();
+        std::fs::create_dir_all(d.join("state/frame")).unwrap();
+        std::fs::write(d.join("state/frame/binds"), "kde region Meta+Print\n").unwrap();
         assert!(!app.shortcuts_inactive());
         app.vals.insert("image_format".into(), "webp".into());
         app.save();
@@ -1599,15 +1906,22 @@ mod tests {
         assert_eq!(runs, ["bind"], "{calls}");
     }
 
-    /// A value clipped refuses is shown as the file has it (not as the
+    /// A value frame refuses is shown as the file has it (not as the
     /// widget's fallback), and is what Save keeps.
     #[test]
     fn unparseable_value_is_kept_raw() {
-        let Some(clipped) = clip_script() else { return };
+        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("raw");
-        test_env(&d, &clipped);
+        test_env(&d, &frame);
         let cfg = d.join("config");
+        std::fs::write(&cfg, "video_fps = fast\nnotify = maybe\n").unwrap();
+        // Every audio preset is a value frame check takes.
+        for (v, _) in AUDIO {
+            std::fs::write(&cfg, format!("audio = {v}\n")).unwrap();
+            let o = run_clip(&["check"], Some(&cfg)).unwrap();
+            assert!(o.status.success(), "{v}: {}", stderr_of(&o));
+        }
         std::fs::write(&cfg, "video_fps = fast\nnotify = maybe\n").unwrap();
         let mut app = app_at(&cfg);
         assert_eq!((app.vals["video_fps"].as_str(), app.vals["notify"].as_str()), ("fast", "maybe"));
@@ -1623,17 +1937,17 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "video_fps = 30\nnotify = false\nimage_format = jpg\n");
     }
 
-    /// Nova #4 + #8: Save runs only `clipped bind` (no unbind), one at a time;
+    /// Nova #4 + #8: Save runs only `frame bind` (no unbind), one at a time;
     /// a failed autostart write after the config was saved still reloads
     /// and rebinds, and the rebind result is added to the status.
     #[test]
     fn rebind_once_and_errors_collected() {
-        let Some(clipped) = clip_script() else { return };
+        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("rebind");
-        test_env(&d, &clipped);
-        std::fs::create_dir_all(d.join("state/clipped")).unwrap();
-        std::fs::write(d.join("state/clipped/binds"), "manual\n").unwrap(); // clipped has bound before
+        test_env(&d, &frame);
+        std::fs::create_dir_all(d.join("state/frame")).unwrap();
+        std::fs::write(d.join("state/frame/binds"), "manual\n").unwrap(); // frame has bound before
         std::fs::write(d.join("cfg/autostart"), "a file, so the autostart dir can't be made").unwrap();
         let cfg = d.join("config");
         std::fs::write(&cfg, "bind.region = Meta+Alt+R\n").unwrap();
@@ -1660,15 +1974,15 @@ mod tests {
     /// link stays a link.
     #[test]
     fn symlinked_config_writes_target() {
-        let Some(clipped) = clip_script() else { return };
+        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("link");
-        test_env(&d, &clipped);
+        test_env(&d, &frame);
         std::fs::create_dir_all(d.join("dots")).unwrap();
-        std::fs::create_dir_all(d.join("cfg/clipped")).unwrap();
-        let link = d.join("cfg/clipped/config");
-        std::os::unix::fs::symlink("../../dots/clipped.conf", &link).unwrap();
-        assert!(resolve_link(&link).unwrap().ends_with("cfg/clipped/../../dots/clipped.conf"));
+        std::fs::create_dir_all(d.join("cfg/frame")).unwrap();
+        let link = d.join("cfg/frame/config");
+        std::os::unix::fs::symlink("../../dots/frame.conf", &link).unwrap();
+        assert!(resolve_link(&link).unwrap().ends_with("cfg/frame/../../dots/frame.conf"));
         let mut app = app_at(&link);
         assert!(app.read_error.is_none() && app.status.contains("No config file yet"), "{}", app.status);
         app.vals.insert("video_fps".into(), "30".into());
@@ -1676,8 +1990,8 @@ mod tests {
         assert!(!app.error, "{}", app.status);
         wait_rebind(&mut app);
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "link was replaced");
-        let target = std::fs::read_to_string(d.join("dots/clipped.conf")).unwrap();
-        assert!(target.starts_with("# clipped config") && target.contains("\nvideo_fps = 30 "), "{target}");
+        let target = std::fs::read_to_string(d.join("dots/frame.conf")).unwrap();
+        assert!(target.starts_with("# frame config") && target.contains("\nvideo_fps = 30 "), "{target}");
     }
 
     /// Nova #6: the temp file is new (a planted one isn't reused), keeps
@@ -1685,14 +1999,14 @@ mod tests {
     #[test]
     fn write_checked_modes() {
         use std::os::unix::fs::PermissionsExt;
-        let Some(clipped) = clip_script() else { return };
+        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("mode");
-        test_env(&d, &clipped);
+        test_env(&d, &frame);
         let cfg = d.join("config");
         std::fs::write(&cfg, "video_fps = 30\n").unwrap();
         std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let planted = d.join(format!(".config.clipped-gui-{}-0.tmp", std::process::id()));
+        let planted = d.join(format!(".config.frame-gui-{}-0.tmp", std::process::id()));
         std::fs::write(&planted, "planted").unwrap();
         write_checked(&cfg, b"video_fps = 45\n").unwrap();
         assert_eq!(std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o7777, 0o600);
@@ -1709,14 +2023,14 @@ mod tests {
         assert_eq!(std::fs::metadata(&new).unwrap().permissions().mode() & 0o7777, 0o644 & !umask);
     }
 
-    /// write_checked against the real bin/clipped: a bad value leaves the file
+    /// write_checked against the real bin/frame: a bad value leaves the file
     /// alone, a good one replaces it (skipped without bash).
     #[test]
     fn write_checked_uses_clip_check() {
-        let Some(clipped) = clip_script() else { return };
+        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("wc");
-        test_env(&d, &clipped);
+        test_env(&d, &frame);
         let cfg = d.join("config");
         std::fs::write(&cfg, "video_fps = 30 # mine\n").unwrap();
         let err = write_checked(&cfg, b"video_fps = fast # mine\n").unwrap_err();
@@ -1729,7 +2043,7 @@ mod tests {
         assert!(left.is_empty(), "temp files left behind: {left:?}");
 
         let t = template(&d);
-        assert!(t.contains("bind.record = Meta+Alt+V") && t.contains("# clipped config"));
+        assert!(t.contains("bind.record = Meta+Alt+V") && t.contains("# frame config"));
         let defaults = config::parse(&t);
         for (k, v) in config::DEFAULTS {
             assert_eq!(defaults[*k], *v, "default_config() and DEFAULTS disagree on {k}");

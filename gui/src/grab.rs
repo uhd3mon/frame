@@ -1,10 +1,10 @@
-//! `clipped-gui --grab MODE [X Y W H] OUT.png`: a screenshot through KWin's
+//! `frame-gui --grab MODE [X Y W H] OUT.png`: a screenshot through KWin's
 //! own org.kde.KWin.ScreenShot2 D-Bus API, so KDE needs no Spectacle.
 //!
 //! KWin only answers callers whose /proc/PID/exe is the Exec of a .desktop
 //! file with `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2`
-//! (install.sh writes that into clipped.desktop). That is why this lives in
-//! the compiled binary and not in bin/clipped: authorizing a shell tool
+//! (install.sh writes that into frame.desktop). That is why this lives in
+//! the compiled binary and not in bin/frame: authorizing a shell tool
 //! (gdbus, python) would let any script take screenshots.
 //!
 //! KWin writes raw pixels into a pipe we pass; the reply says how to read
@@ -23,15 +23,15 @@ pub fn main(args: &[String]) -> i32 {
     let (call, out) = match parse_args(args) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("clipped-gui: {e}");
-            eprintln!("usage: clipped-gui --grab all|monitor|window|area X Y W H OUT.png");
+            eprintln!("frame-gui: {e}");
+            eprintln!("usage: frame-gui --grab all|monitor|window|area X Y W H OUT.png");
             return 2;
         }
     };
     match grab(&call).and_then(|img| write_png(&img, Path::new(&out))) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("clipped-gui: {e}");
+            eprintln!("frame-gui: {e}");
             1
         }
     }
@@ -126,7 +126,7 @@ fn grab(call: &Call) -> Result<Raw, String> {
 fn describe(e: zbus::Error) -> String {
     match &e {
         zbus::Error::MethodError(name, _, _) if name.as_str() == NOT_AUTHORIZED => {
-            "not authorized: is clipped.desktop installed with an absolute Exec and X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2?".into()
+            "not authorized: is frame.desktop installed with an absolute Exec and X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2?".into()
         }
         zbus::Error::MethodError(name, msg, _) if name.as_str() == "org.freedesktop.DBus.Error.ServiceUnknown" => {
             format!("KWin is not running ({})", msg.as_deref().unwrap_or("no org.kde.KWin"))

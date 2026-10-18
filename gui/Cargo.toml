@@ -1,13 +1,13 @@
 [package]
-name = "clipped-gui"
-version = "0.2.0"
+name = "frame-gui"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
-description = "Tray icon and settings window for clipped"
+description = "Tray icon and settings window for frame"
 publish = false
 
 [[bin]]
-name = "clipped-gui"
+name = "frame-gui"
 path = "src/main.rs"
 
 [dependencies]

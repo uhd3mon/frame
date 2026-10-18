@@ -1,4 +1,4 @@
-//! Paths shared with bin/clipped and the live state read from its pid files.
+//! Paths shared with bin/frame and the live state read from its pid files.
 
 use std::path::{Path, PathBuf};
 
@@ -15,19 +15,19 @@ pub fn uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// bin/clipped line 9: ${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/clipped-$UID}/clipped
+/// bin/frame line 9: ${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/frame-$UID}/frame
 pub fn rundir() -> PathBuf {
     match env_path("XDG_RUNTIME_DIR") {
-        Some(d) => d.join("clipped"),
+        Some(d) => d.join("frame"),
         None => env_path("TMPDIR")
             .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(format!("clipped-{}", uid()))
-            .join("clipped"),
+            .join(format!("frame-{}", uid()))
+            .join("frame"),
     }
 }
 
 /// Create the runtime dir. Without XDG_RUNTIME_DIR it is under /tmp, so
-/// (like ensure_rundir in bin/clipped) refuse a base we don't own.
+/// (like ensure_rundir in bin/frame) refuse a base we don't own.
 pub fn ensure_rundir() -> Result<PathBuf, String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let dir = rundir();
@@ -45,10 +45,10 @@ pub fn ensure_rundir() -> Result<PathBuf, String> {
 }
 
 pub fn config_path() -> PathBuf {
-    if let Some(p) = env_path("CLIPPED_CONFIG") {
+    if let Some(p) = env_path("FRAME_CONFIG") {
         return p;
     }
-    config_home().join("clipped/config")
+    config_home().join("frame/config")
 }
 
 pub fn config_home() -> PathBuf {
@@ -56,11 +56,28 @@ pub fn config_home() -> PathBuf {
 }
 
 pub fn binds_state() -> PathBuf {
-    env_path("XDG_STATE_HOME").unwrap_or_else(|| home().join(".local/state")).join("clipped/binds")
+    env_path("XDG_STATE_HOME").unwrap_or_else(|| home().join(".local/state")).join("frame/binds")
 }
 
 pub fn autostart_file() -> PathBuf {
-    config_home().join("autostart/clipped-gui.desktop")
+    config_home().join("autostart/frame-gui.desktop")
+}
+
+/// RUNDIR/tray.pid: "PID STARTTIME" of the running tray (it owns the daemon).
+pub fn tray_pid_file(rundir: &Path) -> PathBuf {
+    rundir.join("tray.pid")
+}
+
+/// Write FILE as bin/frame's write_pid does, for our own process.
+pub fn write_own_pid(file: &Path) -> std::io::Result<()> {
+    let pid = std::process::id();
+    let start = proc_start(Path::new("/proc"), pid).unwrap_or_default();
+    std::fs::write(file, format!("{pid} {start}\n"))
+}
+
+/// Is the tray running (so it applies daemon settings itself)?
+pub fn tray_running(proc_root: &Path, rundir: &Path) -> bool {
+    live_pid(proc_root, &tray_pid_file(rundir)).is_some()
 }
 
 /// save_dir with ~ and ~/ expanded (only those, like expand_dir).
@@ -108,7 +125,7 @@ pub fn live_pid(proc_root: &Path, file: &Path) -> Option<PidFile> {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Status {
-    /// Output file of a running `clipped record`.
+    /// Output file of a running `frame record`.
     pub recording: Option<String>,
     /// Replay buffer length in seconds, when the buffer runs.
     pub replay: Option<String>,
@@ -130,13 +147,13 @@ impl Status {
     pub fn tooltip(&self) -> String {
         if let Some(f) = &self.recording {
             let name = Path::new(f).file_name().map(|n| n.to_string_lossy().into_owned());
-            return format!("clipped: recording to {}", name.unwrap_or_else(|| f.clone()));
+            return format!("Frame: recording to {}", name.unwrap_or_else(|| f.clone()));
         }
         match (&self.replay, self.daemon) {
-            (Some(s), _) if !s.is_empty() => format!("clipped: replay buffer {s} s"),
-            (Some(_), _) => "clipped: replay buffer on".into(),
-            (None, true) => "clipped: running, replay buffer off".into(),
-            (None, false) => "clipped: not running".into(),
+            (Some(s), _) if !s.is_empty() => format!("Frame: replay buffer {s} s"),
+            (Some(_), _) => "Frame: replay buffer on".into(),
+            (None, true) => "Frame: running, replay buffer off".into(),
+            (None, false) => "Frame: not running".into(),
         }
     }
 }
@@ -172,13 +189,13 @@ mod tests {
         fake_proc(&p, 200, "bash", "600");
         fake_proc(&p, 201, "gpu screen) rec", "601");
 
-        assert_eq!(Status::read(&p, &run).tooltip(), "clipped: not running");
+        assert_eq!(Status::read(&p, &run).tooltip(), "Frame: not running");
 
         std::fs::write(run.join("daemon.pid"), "200 600\n").unwrap();
         std::fs::write(run.join("replay.pid"), "201 601\n60\n").unwrap();
         let s = Status::read(&p, &run);
         assert_eq!(s, Status { recording: None, replay: Some("60".into()), daemon: true });
-        assert_eq!(s.tooltip(), "clipped: replay buffer 60 s");
+        assert_eq!(s.tooltip(), "Frame: replay buffer 60 s");
 
         // Stale: same pid, other start time -> not live.
         std::fs::write(run.join("record.pid"), "100 499\n/v/a.mp4\ngsr\n").unwrap();
@@ -186,7 +203,7 @@ mod tests {
         std::fs::write(run.join("record.pid"), "100 500\n/v/2026_record.mp4\ngsr\n").unwrap();
         let s = Status::read(&p, &run);
         assert_eq!(s.recording.as_deref(), Some("/v/2026_record.mp4"));
-        assert_eq!(s.tooltip(), "clipped: recording to 2026_record.mp4");
+        assert_eq!(s.tooltip(), "Frame: recording to 2026_record.mp4");
 
         // Replay without a live daemon doesn't count.
         std::fs::remove_file(run.join("daemon.pid")).unwrap();

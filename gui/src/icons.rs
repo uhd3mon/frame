@@ -13,10 +13,10 @@ macro_rules! sizes {
     };
 }
 
-pub const IDLE: &[&[u8]] = sizes!("clipped-idle");
-pub const REPLAY: &[&[u8]] = sizes!("clipped-replay");
-pub const RECORDING: &[&[u8]] = sizes!("clipped-recording");
-pub const APP_64: &[u8] = include_bytes!("../icons/png/clipped-64.png");
+pub const IDLE: &[&[u8]] = sizes!("frame-idle");
+pub const REPLAY: &[&[u8]] = sizes!("frame-replay");
+pub const RECORDING: &[&[u8]] = sizes!("frame-recording");
+pub const APP_64: &[u8] = include_bytes!("../icons/png/frame-64.png");
 
 /// Decode a PNG to (width, height, RGBA8).
 pub fn rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
