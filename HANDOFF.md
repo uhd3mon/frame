@@ -13,8 +13,9 @@ names (clip, clipped).
 
 ## Published on GitHub (2026-10-18)
 
-- Public repo https://github.com/KevinEightSeven/frame (MIT), branch
-  `main`, remote `origin`. Pushing is OK for this project.
+- Public repo https://github.com/uhd3mon/frame (MIT, detected by
+  GitHub), branch `main`, remote `origin`. The gh login is `uhd3mon`
+  (LICENSE copyright says KevinEightSeven).
 - Kevin's rule: no Claude contributors or commit references. History was
   rewritten before the first push to drop every `Co-Authored-By: Claude`
   trailer (all commits were affected; hashes changed, e.g. 9fc9a92 ->
@@ -22,7 +23,10 @@ names (clip, clipped).
 - CLAUDE.md is gitignored and removed from history; it stays locally
   (content `@AGENTS.md`) for Workspace. Pre-rewrite backup bundle was
   in the scratch tmp/ only.
-- Checks before push: bash -n, smoke and cargo test (see commit).
+- Checks before push: bash -n ok; smoke "114 checks, all passed";
+  cargo test "55 passed". After push: repo PUBLIC, 0 commit messages
+  matching claude/anthropic/co-authored, only contributor uhd3mon.
+- README screenshots (shots/*.png) are gitignored, so none are on GitHub.
 
 ## Frame 0.3.0: Sora's check + real install (2026-10-17 ~23:58)
 
