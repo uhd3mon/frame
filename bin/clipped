@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# clip - screenshots, replay clips and recordings on any Linux desktop.
+# clipped - screenshots, replay clips and recordings on any Linux desktop.
 # Runs in the background with global shortcuts; no UI. MIT licence.
 set -euo pipefail
 
 VERSION="0.2.0"
-CLIP_BIN="$(readlink -f "${BASH_SOURCE[0]}")"
+CLIPPED_BIN="$(readlink -f "${BASH_SOURCE[0]}")"
 ACTIONS=(region window monitor all replay record)
-RUNDIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/clip-$UID}/clip"
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/clip"
-THUMB_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/clip/thumbs"
-CONFIG="${CLIP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/clip/config}"
-STOP_WAIT="${CLIP_STOP_WAIT:-10}"   # seconds a recorder gets to finish after INT
+RUNDIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/clipped-$UID}/clipped"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/clipped"
+THUMB_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/clipped/thumbs"
+CONFIG="${CLIPPED_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/clipped/config}"
+STOP_WAIT="${CLIPPED_STOP_WAIT:-10}"   # seconds a recorder gets to finish after INT
 [[ "$STOP_WAIT" =~ ^[0-9]+$ ]] || STOP_WAIT=10
 COPIED=0
 TMPD=""
@@ -26,7 +26,7 @@ declare -A CFG=(
 
 usage() {
     cat <<'EOF'
-Usage: clip <command>
+Usage: clipped <command>
 
 Screenshots:  region | window | monitor | all
 Video:        replay       save the last N seconds of the replay buffer
@@ -37,16 +37,16 @@ Background:   daemon       apply shortcuts and run the replay buffer
 Other:        status | config | --detect | --help | --version
               check        validate the config: prints ok, or exits 2
 
-Config: ${XDG_CONFIG_HOME:-~/.config}/clip/config (env CLIP_CONFIG overrides).
-CLIP_DRY_RUN=1 prints capture, record, clipboard, notification and bind
+Config: ${XDG_CONFIG_HOME:-~/.config}/clipped/config (env CLIPPED_CONFIG overrides).
+CLIPPED_DRY_RUN=1 prints capture, record, clipboard, notification and bind
 commands instead of running them.
 EOF
 }
 
-die() { echo "clip: $1" >&2; exit "${2:-1}"; }
-warn() { echo "clip: $*" >&2; }
+die() { echo "clipped: $1" >&2; exit "${2:-1}"; }
+warn() { echo "clipped: $*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
-dry() { [[ "${CLIP_DRY_RUN:-0}" == 1 ]]; }
+dry() { [[ "${CLIPPED_DRY_RUN:-0}" == 1 ]]; }
 yes_() { [[ "${1,,}" =~ ^(true|yes|on|1)$ ]]; }
 stamp() { date +%Y-%m-%d_%H-%M-%S; }
 
@@ -72,7 +72,7 @@ run_in() {
 # lives in /tmp, so make sure nobody else owns or planted it.
 ensure_rundir() {
     if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
-        local base="${RUNDIR%/clip}"
+        local base="${RUNDIR%/clipped}"
         mkdir -m 700 "$base" 2>/dev/null || true
         [[ -d "$base" && ! -L "$base" && -O "$base" ]] \
             || die "$base is not a directory owned by you; set XDG_RUNTIME_DIR"
@@ -85,11 +85,11 @@ ensure_rundir() {
 
 default_config() {
     cat <<'EOF'
-# clip config: key = value. # starts a comment at the start of a line or
+# clipped config: key = value. # starts a comment at the start of a line or
 # after a space. Values may be quoted. Delete a line to use its default.
 # Only ~ and ~/ are expanded; $VARS are not.
 
-save_dir = ~/Documents     # files go to <save_dir>/clip/images and /clip/videos
+save_dir = ~/Documents     # files go to <save_dir>/clipped/images and /clipped/videos
 image_format = png         # png | jpg | webp
 video_format = mp4         # mp4 | webm | mkv
 clipboard = true           # copy each capture to the clipboard
@@ -116,7 +116,7 @@ EOF
 
 # Parse key = value lines. The file is never sourced or evaluated.
 # LC_ALL=C: [[:space:]] and ${x,,} are ASCII only, whatever the locale
-# (clip-gui's parser follows the same rule).
+# (clipped-gui's parser follows the same rule).
 load_config() {
     local LC_ALL=C line key val n=0
     if [[ -f "$CONFIG" ]]; then
@@ -169,7 +169,7 @@ expand_dir() {
     if [[ "$d" == "~" ]]; then d="$HOME"; elif [[ "$d" == "~/"* ]]; then d="$HOME/${d#\~/}"; fi
     echo "$d"
 }
-save_root() { echo "$(expand_dir "${CFG[save_dir]}")/clip"; }
+save_root() { echo "$(expand_dir "${CFG[save_dir]}")/clipped"; }
 images_dir() { echo "$(save_root)/images"; }
 videos_dir() { echo "$(save_root)/videos"; }
 
@@ -332,12 +332,12 @@ copy_file() {
 # Plain notification (no preview), e.g. "Recording started".
 notify() {
     yes_ "${CFG[notify]}" && have notify-send || return 0
-    run notify-send -a clip -i "${3:-camera-photo}" "$1" "$2" || true
+    run notify-send -a clipped -i "${3:-camera-photo}" "$1" "$2" || true
 }
 
 notify_error() {
     yes_ "${CFG[notify]}" && have notify-send || return 0
-    run notify-send -a clip -u critical -i dialog-error "clip" "$1" || true
+    run notify-send -a clipped -u critical -i dialog-error "clipped" "$1" || true
 }
 
 # fail MSG: tell the user (the shortcut has no terminal), then exit 1.
@@ -369,14 +369,14 @@ show_in_folder() {
 notify_saved() {
     yes_ "${CFG[notify]}" && have notify-send || return 0
     if dry; then toast "$1" "$2" "$COPIED"; return 0; fi
-    setsid -f "$CLIP_BIN" _toast "$1" "$2" "$COPIED" </dev/null >/dev/null 2>&1 || true
+    setsid -f "$CLIPPED_BIN" _toast "$1" "$2" "$COPIED" </dev/null >/dev/null 2>&1 || true
 }
 
 # toast FILE TITLE COPIED. KDE gets x-kde-urls (thumbnail you can drag out,
 # like Spectacle); other servers get the image as image-path. Plasma has no
 # video thumbnailer by default, so videos also get our own frame there.
 toast() {
-    local f="$1" title="$2" body thumb="" icon=camera-photo reply args=(-a clip)
+    local f="$1" title="$2" body thumb="" icon=camera-photo reply args=(-a clipped)
     body="$(markup "${f##*/}")"
     [[ "${3:-0}" == 1 ]] && body+=$'\nCopied to clipboard'
     if is_video "$f"; then icon=video-x-generic; thumb="$(video_thumb "$f")" || thumb=""
@@ -449,18 +449,18 @@ capture() {
                         else import -window "$(xdotool getactivewindow)" "$out"; fi ;;
                 *) run import -window root "$out" ;;
             esac ;;
-        *) fail "no screenshot tool for $(desktop)/$(session_type); see clip --detect" ;;
+        *) fail "no screenshot tool for $(desktop)/$(session_type); see clipped --detect" ;;
     esac
 }
 
 cmd_shot() {
     local mode="$1" fmt="${CFG[image_format]}" dir tmp dest
     dir="$(images_dir)"; mkdir -p "$dir"
-    TMPD="$(mktemp -d --tmpdir clip.XXXXXX)"
+    TMPD="$(mktemp -d --tmpdir clipped.XXXXXX)"
     trap 'rm -rf "$TMPD"' EXIT
     tmp="$TMPD/shot.png"
     capture "$mode" "$tmp" || true
-    if ! dry && [[ ! -s "$tmp" ]]; then echo "clip: cancelled" >&2; exit 1; fi
+    if ! dry && [[ ! -s "$tmp" ]]; then echo "clipped: cancelled" >&2; exit 1; fi
     dest="$(new_file "$dir" "$mode" "$fmt")"
     case "$fmt" in
         png) run mv "$tmp" "$dest" ;;
@@ -505,7 +505,7 @@ live_pid() {  # print the PID in FILE if that same process still runs
 # gpu-screen-recorder runs this after each save: path, type.
 write_hook() {
     ensure_rundir
-    printf '#!/bin/sh\nexec %s _saved "$@"\n' "$(quote "$CLIP_BIN")" >"$RUNDIR/hook"
+    printf '#!/bin/sh\nexec %s _saved "$@"\n' "$(quote "$CLIPPED_BIN")" >"$RUNDIR/hook"
     chmod +x "$RUNDIR/hook"
 }
 
@@ -546,7 +546,7 @@ cmd_replay() {
     local pid
     if pid="$(live_pid "$RUNDIR/replay.pid")"; then run kill -USR1 "$pid"
     elif dry; then echo "+ kill -USR1 <replay pid>"
-    else fail "replay buffer is not running (start it with: clip daemon, or clip service on)"; fi
+    else fail "replay buffer is not running (start it with: clipped daemon, or clipped service on)"; fi
 }
 
 # stop_recorder PID: INT, then TERM after STOP_WAIT s; fails if still alive.
@@ -565,7 +565,7 @@ cmd_record() {
     local pidf="$RUNDIR/record.pid" pid f kind cmd
     ensure_rundir
     exec 9>"$RUNDIR/record.lock"
-    flock -n 9 || die "clip record is already starting or stopping"
+    flock -n 9 || die "clipped record is already starting or stopping"
     if pid="$(live_pid "$pidf")"; then
         { read -r _; read -r f; read -r kind; } <"$pidf"
         stop_recorder "$pid" || fail "recorder (pid $pid) is still running; kept $pidf"
@@ -589,8 +589,8 @@ cmd_record() {
     write_pid "$pidf" "$pid" "$f" "$kind"
     sleep 1
     live_pid "$pidf" >/dev/null || { rm -f "$pidf"; fail "recorder exited; see $RUNDIR/record.log"; }
-    notify "Recording started" "Press ${CFG[bind.record]:-clip record} again to stop" media-record
-    echo "recording to $f (run clip record again to stop)"
+    notify "Recording started" "Press ${CFG[bind.record]:-clipped record} again to stop" media-record
+    echo "recording to $f (run clipped record again to stop)"
 }
 
 replay_cmd() {  # one argument per line
@@ -625,7 +625,7 @@ cmd_daemon() {
         if yes_ "${CFG[replay]}"; then
             "${cmd[@]}" </dev/null 8>&- &
             gpid=$!; write_pid "$RUNDIR/replay.pid" "$gpid" "$secs"
-            echo "clip: replay buffer running (${secs}s, pid $gpid)"
+            echo "clipped: replay buffer running (${secs}s, pid $gpid)"
             wait "$gpid" || true
             ((stop)) && break
             rm -f "$RUNDIR/replay.pid"; gpid=""
@@ -637,7 +637,7 @@ cmd_daemon() {
     done
     if [[ -n "$gpid" ]]; then wait "$gpid" 2>/dev/null || true; fi
     rm -f "$RUNDIR/replay.pid" "$RUNDIR/daemon.pid"
-    echo "clip: daemon stopped"
+    echo "clipped: daemon stopped"
 }
 
 # ------------------------------------------------------------------- binds
@@ -759,18 +759,18 @@ systemd_arg() {  # for the program path only: systemd never expands $ there
 }
 gv_str() { local s="${1//\\/"\\\\"}"; echo "'${s//\'/"\\'"}'"; }
 
-kde_id() { echo "[\"clip-$1.desktop\",\"_launch\",\"clip $1\",\"clip $1\"]"; }
-kde_desktop() { echo "${XDG_DATA_HOME:-$HOME/.local/share}/applications/clip-$1.desktop"; }
+kde_id() { echo "[\"clipped-$1.desktop\",\"_launch\",\"clipped $1\",\"clipped $1\"]"; }
+kde_desktop() { echo "${XDG_DATA_HOME:-$HOME/.local/share}/applications/clipped-$1.desktop"; }
 kglobal() { runq gdbus call --session -d org.kde.kglobalaccel -o /kglobalaccel -m "org.kde.KGlobalAccel.$1" "${@:2}"; }
 
 kde_bind() {  # kde_bind ACTION SHORTCUT
     local a="$1" want got d
     want="$(qt_keyint "$2")"; d="$(kde_desktop "$a")"
-    if dry; then echo "+ write $d (Exec=$(desktop_arg "$CLIP_BIN") $a)"
+    if dry; then echo "+ write $d (Exec=$(desktop_arg "$CLIPPED_BIN") $a)"
     else
         mkdir -p "$(dirname "$d")"
-        printf '[Desktop Entry]\nType=Application\nName=clip %s\nExec=%s %s\nNoDisplay=true\nX-KDE-GlobalAccel-CommandShortcut=true\n' \
-            "$a" "$(desktop_arg "$CLIP_BIN")" "$a" >"$d"
+        printf '[Desktop Entry]\nType=Application\nName=clipped %s\nExec=%s %s\nNoDisplay=true\nX-KDE-GlobalAccel-CommandShortcut=true\n' \
+            "$a" "$(desktop_arg "$CLIPPED_BIN")" "$a" >"$d"
     fi
     kglobal doRegister "$(kde_id "$a")"
     if dry; then kglobal setShortcut "$(kde_id "$a")" "[$want]" 4; return 0; fi
@@ -785,7 +785,7 @@ kde_bind() {  # kde_bind ACTION SHORTCUT
 
 kde_unbind() {  # kde_unbind ACTION [SHORTCUT]
     kglobal setShortcut "$(kde_id "$1")" '[]' 4 || true
-    kglobal unregister "clip-$1.desktop" _launch || true
+    kglobal unregister "clipped-$1.desktop" _launch || true
     run rm -f "$(kde_desktop "$1")"
 }
 
@@ -799,7 +799,7 @@ hypr_owner() {
     done
     key="$(key_info "$SC_KEY")"; key="${key#* }"
     json="$(hyprctl binds -j 2>/dev/null)" || { echo free; return; }
-    jq -r --argjson m "$mask" --arg k "${key,,}" --arg bin "$CLIP_BIN" '
+    jq -r --argjson m "$mask" --arg k "${key,,}" --arg bin "$CLIPPED_BIN" '
         [.[] | select(.modmask == $m and ((.key // "") | ascii_downcase) == $k)]
         | if length == 0 then "free"
           elif all(.[]; (.arg // "") | contains($bin)) then "ours"
@@ -812,7 +812,7 @@ hyprland_bind() {  # hyprland_bind ACTION SHORTCUT
         taken) warn "shortcut $2 is already bound in Hyprland, skipped ($1)"; return 1 ;;
         ours) runq hyprctl keyword unbind "$b" || true ;;
     esac
-    runq hyprctl keyword bind "$b, exec, $(quote "$CLIP_BIN") $1"
+    runq hyprctl keyword bind "$b, exec, $(quote "$CLIPPED_BIN") $1"
 }
 
 hyprland_unbind() {  # hyprland_unbind ACTION SHORTCUT
@@ -853,7 +853,7 @@ sway_taken() {
 
 sway_bind() {  # sway_bind ACTION SHORTCUT (one string, so paths may hold spaces)
     if sway_taken "$2"; then warn "shortcut $2 is already bound in sway, skipped ($1)"; return 1; fi
-    runq swaymsg "bindsym $(bind_combo sway "$2") exec $(quote "$CLIP_BIN") $1"
+    runq swaymsg "bindsym $(bind_combo sway "$2") exec $(quote "$CLIPPED_BIN") $1"
 }
 
 sway_unbind() {
@@ -875,19 +875,19 @@ gnome_paths() {
     tr ',' '\n' <<<"$l" | sed "s/^ *'//; s/' *$//" | grep -v '^$' || true
 }
 
-# gnome_apply "action shortcut"...: make clip's custom shortcuts exactly these.
+# gnome_apply "action shortcut"...: make clipped's custom shortcuts exactly these.
 gnome_apply() {
     local list p a key pair keep=() old=() mine=" "
     list="$(gnome_paths)" || { warn "cannot read GNOME custom shortcuts; nothing changed"; return 1; }
     while read -r p; do
         [[ -n "$p" ]] || continue
-        if [[ "$p" == "$GP/clip-"* ]]; then old+=("$p"); else keep+=("$p"); fi
+        if [[ "$p" == "$GP/clipped-"* ]]; then old+=("$p"); else keep+=("$p"); fi
     done <<<"$list"
     for pair; do
-        a="${pair%% *}"; key="${pair#* }"; p="$GP/clip-$a/"
+        a="${pair%% *}"; key="${pair#* }"; p="$GP/clipped-$a/"
         keep+=("$p"); mine+="$p "
-        run gsettings set "$GS.custom-keybinding:$p" name "$(gv_str "clip $a")"
-        run gsettings set "$GS.custom-keybinding:$p" command "$(gv_str "$(quote "$CLIP_BIN") $a")"
+        run gsettings set "$GS.custom-keybinding:$p" name "$(gv_str "clipped $a")"
+        run gsettings set "$GS.custom-keybinding:$p" command "$(gv_str "$(quote "$CLIPPED_BIN") $a")"
         run gsettings set "$GS.custom-keybinding:$p" binding "$(gv_str "$(bind_combo gnome "$key")")"
     done
     local out=""
@@ -899,7 +899,7 @@ gnome_apply() {
     done
 }
 
-unbind_saved() {  # unbind_saved BACKEND: remove what clip bound last time
+unbind_saved() {  # unbind_saved BACKEND: remove what clipped bound last time
     local be="$1" a key saved
     saved="$(state_get "$be")"
     while read -r a key; do
@@ -913,15 +913,15 @@ unbind_saved() {  # unbind_saved BACKEND: remove what clip bound last time
 }
 
 # One bind/unbind at a time: the daemon binds when it starts, and
-# clip-gui rebinds on Save. The lock fd is closed before returning, so a
+# clipped-gui rebinds on Save. The lock fd is closed before returning, so a
 # daemon doesn't hold it (or hand it to gsr) for its whole life.
 with_bind_lock() {
     local fd rc=0
     ensure_rundir
     exec {fd}>"$RUNDIR/bind.lock"
-    if ! flock -w "${CLIP_BIND_WAIT:-30}" "$fd"; then
+    if ! flock -w "${CLIPPED_BIND_WAIT:-30}" "$fd"; then
         exec {fd}>&-
-        warn "another clip bind/unbind is still running"; return 1
+        warn "another clipped bind/unbind is still running"; return 1
     fi
     "$@" || rc=$?
     exec {fd}>&-
@@ -936,9 +936,9 @@ bind_now() {
     be="$(bind_backend)"
     case "$be" in
         manual)
-            echo "clip: no shortcut support for this desktop; bind these yourself:"
+            echo "clipped: no shortcut support for this desktop; bind these yourself:"
             for a in "${ACTIONS[@]}"; do
-                [[ -n "${CFG[bind.$a]}" ]] && echo "  ${CFG[bind.$a]}  ->  $(quote "$CLIP_BIN") $a"
+                [[ -n "${CFG[bind.$a]}" ]] && echo "  ${CFG[bind.$a]}  ->  $(quote "$CLIPPED_BIN") $a"
             done
             return 0 ;;
         gnome)
@@ -959,7 +959,7 @@ bind_now() {
 unbind_now() {
     local be; be="$(bind_backend)"
     case "$be" in
-        manual) echo "clip: remove your manual shortcuts for clip"; return 0 ;;
+        manual) echo "clipped: remove your manual shortcuts for clipped"; return 0 ;;
         gnome) gnome_apply || return 1 ;;
         *) unbind_saved "$be" ;;
     esac
@@ -968,23 +968,23 @@ unbind_now() {
 
 # ----------------------------------------------------------------- service
 
-unit_file() { echo "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/clip.service"; }
+unit_file() { echo "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/clipped.service"; }
 
 cmd_service() {
     local u; u="$(unit_file)"
     case "${1:-}" in
         on)
-            if dry; then echo "+ write $u (ExecStart=$(systemd_arg "$CLIP_BIN") daemon)"
+            if dry; then echo "+ write $u (ExecStart=$(systemd_arg "$CLIPPED_BIN") daemon)"
             else
                 mkdir -p "$(dirname "$u")"
                 cat >"$u" <<EOF
 [Unit]
-Description=clip screenshot shortcuts and replay buffer
+Description=clipped screenshot shortcuts and replay buffer
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
-ExecStart=$(systemd_arg "$CLIP_BIN") daemon
+ExecStart=$(systemd_arg "$CLIPPED_BIN") daemon
 Restart=on-failure
 RestartSec=5
 
@@ -999,25 +999,25 @@ EOF
             done
             ((${#vars[@]})) && run systemctl --user import-environment "${vars[@]}"
             run systemctl --user daemon-reload
-            run systemctl --user enable --now clip.service ;;
+            run systemctl --user enable --now clipped.service ;;
         off)
-            run systemctl --user disable --now clip.service || true
+            run systemctl --user disable --now clipped.service || true
             run rm -f "$u"
             run systemctl --user daemon-reload ;;
-        *) die "usage: clip service on|off" 2 ;;
+        *) die "usage: clipped service on|off" 2 ;;
     esac
 }
 
 cmd_status() {
     local f pid
-    echo "config: $CONFIG$([[ -f $CONFIG ]] || echo ' (defaults; run clip config)')"
+    echo "config: $CONFIG$([[ -f $CONFIG ]] || echo ' (defaults; run clipped config)')"
     echo "images: $(images_dir)"
     echo "videos: $(videos_dir)"
     if pid="$(live_pid "$RUNDIR/daemon.pid")"; then echo "daemon: running (pid $pid)"; else echo "daemon: stopped"; fi
     if live_pid "$RUNDIR/replay.pid" >/dev/null; then echo "replay: running, $(sed -n 2p "$RUNDIR/replay.pid")s buffer"; else echo "replay: off"; fi
     if live_pid "$RUNDIR/record.pid" >/dev/null; then f="$(sed -n 2p "$RUNDIR/record.pid")"; echo "record: recording to $f"; else echo "record: idle"; fi
     if have systemctl; then
-        echo "service: $(systemctl --user is-enabled clip.service 2>/dev/null || true)/$(systemctl --user is-active clip.service 2>/dev/null || true)"
+        echo "service: $(systemctl --user is-enabled clipped.service 2>/dev/null || true)/$(systemctl --user is-active clipped.service 2>/dev/null || true)"
     fi
 }
 
@@ -1027,7 +1027,7 @@ main() {
     local cmd="${1:-}"
     case "$cmd" in
         -h|--help|help) usage; return 0 ;;
-        -v|--version) echo "clip $VERSION"; return 0 ;;
+        -v|--version) echo "clipped $VERSION"; return 0 ;;
         "") usage >&2; return 2 ;;
     esac
     load_config
@@ -1045,7 +1045,7 @@ main() {
         check) echo ok ;;   # load_config above already validated it
         _saved) cmd_saved "${2:?}" "${3:-regular}" ;;
         _toast) toast "${2:?}" "${3:?}" "${4:-0}" ;;
-        *) echo "clip: unknown command: $cmd" >&2; usage >&2; return 2 ;;
+        *) echo "clipped: unknown command: $cmd" >&2; usage >&2; return 2 ;;
     esac
 }
 

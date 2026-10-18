@@ -1,5 +1,5 @@
-//! The tray icon (StatusNotifierItem via ksni). State comes from bin/clip's
-//! pid files, polled once a second; menu items run clip detached.
+//! The tray icon (StatusNotifierItem via ksni). State comes from bin/clipped's
+//! pid files, polled once a second; menu items run clipped detached.
 
 use crate::state::{self, Status};
 use crate::{clip_detached, config, icons};
@@ -44,10 +44,10 @@ fn shot(label: &str, mode: &'static str) -> ksni::MenuItem<ClipTray> {
 
 impl ksni::Tray for ClipTray {
     fn id(&self) -> String {
-        "clip".into()
+        "clipped".into()
     }
     fn title(&self) -> String {
-        "clip".into()
+        "Clipped".into()
     }
     fn category(&self) -> ksni::Category {
         ksni::Category::ApplicationStatus
@@ -84,7 +84,7 @@ impl ksni::Tray for ClipTray {
                 ..Default::default()
             }
             .into(),
-            item("Open clip folder", true, |_| open_folder()),
+            item("Open Clipped folder", true, |_| open_folder()),
             ksni::MenuItem::Separator,
             CheckmarkItem {
                 label: "Background service".into(),
@@ -104,14 +104,14 @@ impl ksni::Tray for ClipTray {
 
 fn open_folder() {
     let text = std::fs::read_to_string(state::config_path()).unwrap_or_default();
-    let dir = state::expand_dir(&config::parse(&text)["save_dir"]).join("clip");
+    let dir = state::expand_dir(&config::parse(&text)["save_dir"]).join("clipped");
     let _ = std::fs::create_dir_all(&dir);
     crate::spawn_detached(Command::new("xdg-open").arg(dir));
 }
 
 pub fn service_active() -> bool {
     Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", "clip.service"])
+        .args(["--user", "is-active", "--quiet", "clipped.service"])
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
@@ -131,7 +131,7 @@ pub fn run() -> i32 {
     let handle = match tray.assume_sni_available(true).spawn() {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("clip-gui: cannot show the tray icon: {e}");
+            eprintln!("clipped-gui: cannot show the tray icon: {e}");
             return 1;
         }
     };

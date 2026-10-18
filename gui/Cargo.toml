@@ -1,13 +1,13 @@
 [package]
-name = "clip-gui"
+name = "clipped-gui"
 version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "Tray icon and settings window for clip"
+description = "Tray icon and settings window for clipped"
 publish = false
 
 [[bin]]
-name = "clip-gui"
+name = "clipped-gui"
 path = "src/main.rs"
 
 [dependencies]

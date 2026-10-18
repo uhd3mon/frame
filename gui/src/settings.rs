@@ -1,4 +1,4 @@
-//! The settings window: edits the clip config, checks it with `clip check`
+//! The settings window: edits the clipped config, checks it with `clipped check`
 //! before it replaces the real file, and re-applies shortcuts.
 
 use crate::config::{self, ACTIONS};
@@ -24,7 +24,7 @@ enum Msg {
     Folder(PathBuf),
     Monitors(Vec<String>),
     Status(String, bool),
-    /// Result of `clip bind`; it replaces "Updating shortcuts…" in the status.
+    /// Result of `clipped bind`; it replaces "Updating shortcuts…" in the status.
     Rebind(String, bool),
 }
 
@@ -43,31 +43,31 @@ struct App {
     /// Set when the config exists but can't be read: Save is off, so the
     /// template can never replace a file we failed to read.
     read_error: Option<String>,
-    /// A `clip bind` is in flight; Save waits for it.
+    /// A `clipped bind` is in flight; Save waits for it.
     rebinding: bool,
     offer_restart: bool,
     monitors: Vec<String>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     ctx: egui::Context,
-    /// CLIP_GUI_SHOT=FILE.png: save this window's own frame and quit (docs, review).
+    /// CLIPPED_GUI_SHOT=FILE.png: save this window's own frame and quit (docs, review).
     shot: Option<(PathBuf, u32)>,
 }
 
 pub fn run() -> i32 {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("clip settings")
-        .with_app_id("clip")
+        .with_title("Clipped settings")
+        .with_app_id("clipped")
         .with_inner_size([560.0, 720.0])
         .with_min_inner_size([440.0, 360.0]);
     if let Some((w, h, rgba)) = crate::icons::rgba(crate::icons::APP_64) {
         viewport = viewport.with_icon(egui::IconData { rgba, width: w, height: h });
     }
     let opts = eframe::NativeOptions { viewport, ..Default::default() };
-    match eframe::run_native("clip", opts, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx))))) {
+    match eframe::run_native("Clipped", opts, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx))))) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("clip-gui: {e}");
+            eprintln!("clipped-gui: {e}");
             1
         }
     }
@@ -78,7 +78,7 @@ fn run_clip(args: &[&str], config: Option<&Path>) -> Result<Output, String> {
     let mut c = Command::new(&bin);
     c.args(args);
     if let Some(p) = config {
-        c.env("CLIP_CONFIG", p);
+        c.env("CLIPPED_CONFIG", p);
     }
     c.output().map_err(|e| format!("cannot run {}: {e}", bin.display()))
 }
@@ -92,7 +92,7 @@ fn stderr_of(o: &Output) -> String {
     }
 }
 
-/// Escape a path for a desktop entry Exec= line (same as desktop_arg in bin/clip).
+/// Escape a path for a desktop entry Exec= line (same as desktop_arg in bin/clipped).
 pub fn desktop_exec_arg(p: &str) -> String {
     if p.chars().all(|c| c.is_ascii_alphanumeric() || "/._+-".contains(c)) {
         return p.to_string();
@@ -110,7 +110,7 @@ pub fn desktop_exec_arg(p: &str) -> String {
 
 pub fn autostart_entry(exe: &str) -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nName=Clip\nComment=clip tray icon\nExec={}\nIcon=clip\n\
+        "[Desktop Entry]\nType=Application\nName=Clipped\nComment=clipped tray icon\nExec={}\nIcon=clipped\n\
          Terminal=false\nX-GNOME-Autostart-enabled=true\n",
         desktop_exec_arg(exe)
     )
@@ -143,7 +143,7 @@ pub fn resolve_link(path: &Path) -> Result<PathBuf, String> {
 }
 
 /// Write TEXT as the config at PATH: a new temp file next to the real
-/// one (same mode, synced), `clip check` on it, then rename. The real
+/// one (same mode, synced), `clipped check` on it, then rename. The real
 /// file (or a symlink's target, never the link) is untouched on failure.
 pub fn write_checked(path: &Path, text: &[u8]) -> Result<(), String> {
     use std::io::Write;
@@ -155,7 +155,7 @@ pub fn write_checked(path: &Path, text: &[u8]) -> Result<(), String> {
     let mode = std::fs::metadata(&real).ok().map(|m| m.permissions().mode() & 0o7777);
     let mut opened = None;
     for i in 0..100 {
-        let tmp = dir.join(format!(".{name}.clip-gui-{}-{i}.tmp", std::process::id()));
+        let tmp = dir.join(format!(".{name}.clipped-gui-{}-{i}.tmp", std::process::id()));
         match std::fs::OpenOptions::new().write(true).create_new(true).mode(mode.unwrap_or(0o644)).open(&tmp) {
             Ok(f) => {
                 opened = Some((tmp, f));
@@ -196,9 +196,9 @@ pub fn write_checked(path: &Path, text: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// The text `clip config` would write, made in a temp path (not the real one).
+/// The text `clipped config` would write, made in a temp path (not the real one).
 fn template(dir: &Path) -> String {
-    let t = dir.join(format!(".clip-gui-template-{}", std::process::id()));
+    let t = dir.join(format!(".clipped-gui-template-{}", std::process::id()));
     let _ = std::fs::create_dir_all(dir);
     let _ = run_clip(&["config"], Some(&t));
     let text = std::fs::read_to_string(&t).unwrap_or_default();
@@ -206,7 +206,7 @@ fn template(dir: &Path) -> String {
     text
 }
 
-/// clip's name for an egui key (see key_info in bin/clip).
+/// clipped's name for an egui key (see key_info in bin/clipped).
 fn key_name(k: egui::Key) -> Option<String> {
     use egui::Key::*;
     let s = match k {
@@ -244,7 +244,7 @@ impl App {
             tx,
             rx,
             ctx: ctx.clone(),
-            shot: std::env::var_os("CLIP_GUI_SHOT").map(|p| (PathBuf::from(p), 0)),
+            shot: std::env::var_os("CLIPPED_GUI_SHOT").map(|p| (PathBuf::from(p), 0)),
         };
         app.load();
         if cfg!(test) {
@@ -301,7 +301,7 @@ impl App {
         !self.changes().is_empty() || self.autostart != self.autostart_loaded
     }
 
-    /// First problem with the edited values, checked before clip sees them.
+    /// First problem with the edited values, checked before clipped sees them.
     fn problem(&self, changes: &BTreeMap<String, String>) -> Option<String> {
         for (k, v) in changes {
             if let Some(why) = config::unrepresentable(v) {
@@ -355,7 +355,7 @@ impl App {
                 notes.push(UPDATING.into());
                 self.rebind();
             } else {
-                notes.push("Shortcuts apply when clip starts.".into());
+                notes.push("Shortcuts apply when clipped starts.".into());
             }
         }
         if daemon && changes.keys().any(|k| DAEMON_KEYS.contains(&k.as_str())) {
@@ -363,7 +363,7 @@ impl App {
                 self.offer_restart = true;
                 notes.push("Restart the service to use the new video settings.".into());
             } else {
-                notes.push("Restart `clip daemon` to use the new video settings.".into());
+                notes.push("Restart `clipped daemon` to use the new video settings.".into());
             }
         }
         let error = !errors.is_empty();
@@ -384,7 +384,7 @@ impl App {
         std::fs::write(&f, autostart_entry(&exe.to_string_lossy())).map_err(|e| format!("{}: {e}", f.display()))
     }
 
-    /// `clip bind` (it removes what it bound last time first), off the UI
+    /// `clipped bind` (it removes what it bound last time first), off the UI
     /// thread. One at a time: Save is off until it reports.
     fn rebind(&mut self) {
         self.rebinding = true;
@@ -406,7 +406,7 @@ impl App {
         self.set_status("Restarting the service…".into(), false);
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
-            let r = Command::new("systemctl").args(["--user", "restart", "clip.service"]).output();
+            let r = Command::new("systemctl").args(["--user", "restart", "clipped.service"]).output();
             let msg = match r {
                 Ok(o) if o.status.success() => ("Service restarted.".into(), false),
                 Ok(o) => (format!("Restart failed: {}", stderr_of(&o)), true),
@@ -421,7 +421,7 @@ impl App {
         let start = state::expand_dir(&self.vals["save_dir"]);
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
-            let mut d = rfd::FileDialog::new().set_title("clip: save folder");
+            let mut d = rfd::FileDialog::new().set_title("Clipped: save folder");
             if start.is_dir() {
                 d = d.set_directory(start);
             }
@@ -514,7 +514,7 @@ impl App {
             w.write_image_data(img.as_raw()).map_err(|e| e.to_string())
         });
         if let Err(e) = r {
-            eprintln!("clip-gui: {}: {e}", path.display());
+            eprintln!("clipped-gui: {}: {e}", path.display());
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
@@ -532,12 +532,12 @@ fn combo(ui: &mut egui::Ui, id: &str, v: &mut String, options: &[&str]) {
     });
 }
 
-/// The file's value when clip would refuse it, so the widget's fallback
+/// The file's value when clipped would refuse it, so the widget's fallback
 /// (unchecked, 60, …) isn't taken for what the file says.
 fn raw_note(ui: &mut egui::Ui, key: &str, v: &str) {
     if !config::valid_value(key, v) {
         ui.colored_label(Color32::from_rgb(0xe0, 0x50, 0x50), format!("config has '{v}'"))
-            .on_hover_text("clip refuses this value; pick a valid one before saving");
+            .on_hover_text("clipped refuses this value; pick a valid one before saving");
     }
 }
 
@@ -741,7 +741,7 @@ mod tests {
 
     #[test]
     fn exec_quoting_matches_bash() {
-        assert_eq!(desktop_exec_arg("/home/u/.local/bin/clip-gui"), "/home/u/.local/bin/clip-gui");
+        assert_eq!(desktop_exec_arg("/home/u/.local/bin/clipped-gui"), "/home/u/.local/bin/clipped-gui");
         // Same expectation as the "quoting helpers" check in tests/smoke.sh.
         assert_eq!(desktop_exec_arg("/a b/$x%\"q\\"), "\"/a b/\\\\$x%%\\\\\"q\\\\\\\\\"");
     }
@@ -761,10 +761,10 @@ mod tests {
     #[test]
     fn autostart_entry_validates() {
         let d = crate::testutil::tempdir("auto");
-        let f = d.join("clip-gui.desktop");
-        std::fs::write(&f, autostart_entry("/opt/my clip/clip-gui")).unwrap();
+        let f = d.join("clipped-gui.desktop");
+        std::fs::write(&f, autostart_entry("/opt/my clipped/clipped-gui")).unwrap();
         let text = std::fs::read_to_string(&f).unwrap();
-        assert!(text.contains("Exec=\"/opt/my clip/clip-gui\"\n"), "{text}");
+        assert!(text.contains("Exec=\"/opt/my clipped/clipped-gui\"\n"), "{text}");
         assert!(text.contains("X-GNOME-Autostart-enabled=true"));
         if let Ok(o) = Command::new("desktop-file-validate").arg(&f).output() {
             assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
@@ -772,26 +772,26 @@ mod tests {
     }
 
     fn clip_script() -> Option<PathBuf> {
-        let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("../bin/clip");
-        clip.exists().then_some(clip)
+        let clipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../bin/clipped");
+        clipped.exists().then_some(clipped)
     }
 
-    /// Temp XDG dirs, dry-run clip and a desktop with no shortcut backend,
-    /// so nothing here can touch the real session. CLIP_BIN logs each call
-    /// to D/calls, then runs bin/clip.
-    fn test_env(d: &Path, clip: &Path) {
+    /// Temp XDG dirs, dry-run clipped and a desktop with no shortcut backend,
+    /// so nothing here can touch the real session. CLIPPED_BIN logs each call
+    /// to D/calls, then runs bin/clipped.
+    fn test_env(d: &Path, clipped: &Path) {
         for (k, sub) in [("XDG_CONFIG_HOME", "cfg"), ("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"), ("XDG_CACHE_HOME", "cache")] {
             std::fs::create_dir_all(d.join(sub)).unwrap();
             std::env::set_var(k, d.join(sub));
         }
-        let wrap = d.join("clip-wrap");
-        std::fs::write(&wrap, format!("#!/bin/sh\necho \"$*\" >>'{}/calls'\nexec '{}' \"$@\"\n", d.display(), clip.display())).unwrap();
+        let wrap = d.join("clipped-wrap");
+        std::fs::write(&wrap, format!("#!/bin/sh\necho \"$*\" >>'{}/calls'\nexec '{}' \"$@\"\n", d.display(), clipped.display())).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&wrap, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::env::set_var("CLIP_BIN", &wrap);
-        std::env::set_var("CLIP_DRY_RUN", "1");
-        std::env::set_var("XDG_CURRENT_DESKTOP", "clip-test");
-        std::env::remove_var("CLIP_CONFIG");
+        std::env::set_var("CLIPPED_BIN", &wrap);
+        std::env::set_var("CLIPPED_DRY_RUN", "1");
+        std::env::set_var("XDG_CURRENT_DESKTOP", "clipped-test");
+        std::env::remove_var("CLIPPED_CONFIG");
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
         std::env::remove_var("SWAYSOCK");
     }
@@ -811,7 +811,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        panic!("clip bind never reported: {}", app.status);
+        panic!("clipped bind never reported: {}", app.status);
     }
 
     /// Nova #1: a config we can't read (EACCES, or unreadable by the time
@@ -819,11 +819,11 @@ mod tests {
     #[test]
     fn unreadable_config_is_never_replaced() {
         use std::os::unix::fs::PermissionsExt;
-        let Some(clip) = clip_script() else { return };
+        let Some(clipped) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("unread");
-        test_env(&d, &clip);
-        let cfg = d.join("cfg/clip/config");
+        test_env(&d, &clipped);
+        let cfg = d.join("cfg/clipped/config");
         std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
         let mine = "# mine\nvideo_fps = 30\n";
         std::fs::write(&cfg, mine).unwrap();
@@ -857,10 +857,10 @@ mod tests {
     /// Save keeps every other byte.
     #[test]
     fn non_utf8_config_is_edited_in_place() {
-        let Some(clip) = clip_script() else { return };
+        let Some(clipped) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("latin1");
-        test_env(&d, &clip);
+        test_env(&d, &clipped);
         let cfg = d.join("config");
         std::fs::write(&cfg, b"# caf\xe9\r\nvideo_fps = 30   # \xe9\nimage_format = png\n").unwrap();
         let mut app = app_at(&cfg);
@@ -877,35 +877,35 @@ mod tests {
     /// The Save button end to end, headless, in temp XDG dirs.
     #[test]
     fn save_flow() {
-        let Some(clip) = clip_script() else { return };
+        let Some(clipped) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("save");
-        test_env(&d, &clip);
-        let mut app = app_at(&d.join("cfg/clip/config"));
+        test_env(&d, &clipped);
+        let mut app = app_at(&d.join("cfg/clipped/config"));
         assert!(app.status.contains("No config file yet"));
 
-        // New file: clip's template plus the changes; binds wait for clip.
+        // New file: clipped's template plus the changes; binds wait for clipped.
         // Text fields are trimmed.
         app.vals.insert("image_format".into(), "jpg".into());
         app.vals.insert("bind.window".into(), String::new());
         app.vals.insert("video_source".into(), "  DP-1 ".into());
         app.save();
         assert!(!app.error, "{}", app.status);
-        assert!(app.status.contains("Shortcuts apply when clip starts"), "{}", app.status);
+        assert!(app.status.contains("Shortcuts apply when clipped starts"), "{}", app.status);
         let text = std::fs::read_to_string(&app.path).unwrap();
-        assert!(text.starts_with("# clip config"), "{text}");
+        assert!(text.starts_with("# clipped config"), "{text}");
         assert!(text.contains("\nimage_format = jpg         # png | jpg | webp\n"), "{text}");
         assert!(text.contains("\nbind.window =\n"), "{text}");
         assert!(text.contains("\nvideo_source = DP-1        # auto"), "{text}");
         assert!(!app.dirty());
 
-        // clip check refuses: file untouched, error shown.
+        // clipped check refuses: file untouched, error shown.
         app.vals.insert("video_fps".into(), "999".into());
         app.save();
         assert!(app.error && app.status.contains("video_fps must be 1-240"), "{}", app.status);
         assert_eq!(std::fs::read_to_string(&app.path).unwrap(), text);
 
-        // Refused before clip sees it.
+        // Refused before clipped sees it.
         app.load();
         app.vals.insert("audio".into(), "a #b".into());
         app.save();
@@ -920,21 +920,21 @@ mod tests {
         app.load();
         app.autostart = true;
         app.save();
-        let auto = d.join("cfg/autostart/clip-gui.desktop");
+        let auto = d.join("cfg/autostart/clipped-gui.desktop");
         assert!(std::fs::read_to_string(&auto).unwrap().contains("X-GNOME-Autostart-enabled=true"));
         app.autostart = false;
         app.save();
         assert!(!auto.exists() && !app.error, "{}", app.status);
     }
 
-    /// A value clip refuses is shown as the file has it (not as the
+    /// A value clipped refuses is shown as the file has it (not as the
     /// widget's fallback), and is what Save keeps.
     #[test]
     fn unparseable_value_is_kept_raw() {
-        let Some(clip) = clip_script() else { return };
+        let Some(clipped) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("raw");
-        test_env(&d, &clip);
+        test_env(&d, &clipped);
         let cfg = d.join("config");
         std::fs::write(&cfg, "video_fps = fast\nnotify = maybe\n").unwrap();
         let mut app = app_at(&cfg);
@@ -950,17 +950,17 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "video_fps = 30\nnotify = false\nimage_format = jpg\n");
     }
 
-    /// Nova #4 + #8: Save runs only `clip bind` (no unbind), one at a time;
+    /// Nova #4 + #8: Save runs only `clipped bind` (no unbind), one at a time;
     /// a failed autostart write after the config was saved still reloads
     /// and rebinds, and the rebind result is added to the status.
     #[test]
     fn rebind_once_and_errors_collected() {
-        let Some(clip) = clip_script() else { return };
+        let Some(clipped) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("rebind");
-        test_env(&d, &clip);
-        std::fs::create_dir_all(d.join("state/clip")).unwrap();
-        std::fs::write(d.join("state/clip/binds"), "manual\n").unwrap(); // clip has bound before
+        test_env(&d, &clipped);
+        std::fs::create_dir_all(d.join("state/clipped")).unwrap();
+        std::fs::write(d.join("state/clipped/binds"), "manual\n").unwrap(); // clipped has bound before
         std::fs::write(d.join("cfg/autostart"), "a file, so the autostart dir can't be made").unwrap();
         let cfg = d.join("config");
         std::fs::write(&cfg, "bind.region = Meta+Alt+R\n").unwrap();
@@ -987,23 +987,23 @@ mod tests {
     /// link stays a link.
     #[test]
     fn symlinked_config_writes_target() {
-        let Some(clip) = clip_script() else { return };
+        let Some(clipped) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("link");
-        test_env(&d, &clip);
+        test_env(&d, &clipped);
         std::fs::create_dir_all(d.join("dots")).unwrap();
-        std::fs::create_dir_all(d.join("cfg/clip")).unwrap();
-        let link = d.join("cfg/clip/config");
-        std::os::unix::fs::symlink("../../dots/clip.conf", &link).unwrap();
-        assert!(resolve_link(&link).unwrap().ends_with("cfg/clip/../../dots/clip.conf"));
+        std::fs::create_dir_all(d.join("cfg/clipped")).unwrap();
+        let link = d.join("cfg/clipped/config");
+        std::os::unix::fs::symlink("../../dots/clipped.conf", &link).unwrap();
+        assert!(resolve_link(&link).unwrap().ends_with("cfg/clipped/../../dots/clipped.conf"));
         let mut app = app_at(&link);
         assert!(app.read_error.is_none() && app.status.contains("No config file yet"), "{}", app.status);
         app.vals.insert("video_fps".into(), "30".into());
         app.save();
         assert!(!app.error, "{}", app.status);
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "link was replaced");
-        let target = std::fs::read_to_string(d.join("dots/clip.conf")).unwrap();
-        assert!(target.starts_with("# clip config") && target.contains("\nvideo_fps = 30 "), "{target}");
+        let target = std::fs::read_to_string(d.join("dots/clipped.conf")).unwrap();
+        assert!(target.starts_with("# clipped config") && target.contains("\nvideo_fps = 30 "), "{target}");
     }
 
     /// Nova #6: the temp file is new (a planted one isn't reused), keeps
@@ -1011,14 +1011,14 @@ mod tests {
     #[test]
     fn write_checked_modes() {
         use std::os::unix::fs::PermissionsExt;
-        let Some(clip) = clip_script() else { return };
+        let Some(clipped) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("mode");
-        test_env(&d, &clip);
+        test_env(&d, &clipped);
         let cfg = d.join("config");
         std::fs::write(&cfg, "video_fps = 30\n").unwrap();
         std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let planted = d.join(format!(".config.clip-gui-{}-0.tmp", std::process::id()));
+        let planted = d.join(format!(".config.clipped-gui-{}-0.tmp", std::process::id()));
         std::fs::write(&planted, "planted").unwrap();
         write_checked(&cfg, b"video_fps = 45\n").unwrap();
         assert_eq!(std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o7777, 0o600);
@@ -1035,14 +1035,14 @@ mod tests {
         assert_eq!(std::fs::metadata(&new).unwrap().permissions().mode() & 0o7777, 0o644 & !umask);
     }
 
-    /// write_checked against the real bin/clip: a bad value leaves the file
+    /// write_checked against the real bin/clipped: a bad value leaves the file
     /// alone, a good one replaces it (skipped without bash).
     #[test]
     fn write_checked_uses_clip_check() {
-        let Some(clip) = clip_script() else { return };
+        let Some(clipped) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("wc");
-        test_env(&d, &clip);
+        test_env(&d, &clipped);
         let cfg = d.join("config");
         std::fs::write(&cfg, "video_fps = 30 # mine\n").unwrap();
         let err = write_checked(&cfg, b"video_fps = fast # mine\n").unwrap_err();
@@ -1055,7 +1055,7 @@ mod tests {
         assert!(left.is_empty(), "temp files left behind: {left:?}");
 
         let t = template(&d);
-        assert!(t.contains("bind.record = Meta+Alt+V") && t.contains("# clip config"));
+        assert!(t.contains("bind.record = Meta+Alt+V") && t.contains("# clipped config"));
         let defaults = config::parse(&t);
         for (k, v) in config::DEFAULTS {
             assert_eq!(defaults[*k], *v, "default_config() and DEFAULTS disagree on {k}");

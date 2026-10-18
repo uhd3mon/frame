@@ -1,9 +1,9 @@
-//! clip-gui: tray icon and settings window for clip. bin/clip does the
+//! clipped-gui: tray icon and settings window for clipped. bin/clipped does the
 //! work; this only shows its state, runs its commands and edits its config.
 //!
-//!   clip-gui             tray (one per session; if it runs, open settings)
-//!   clip-gui --open      tray if not running, and the settings window
-//!   clip-gui --settings  the settings window only (one at a time)
+//!   clipped-gui             tray (one per session; if it runs, open settings)
+//!   clipped-gui --open      tray if not running, and the settings window
+//!   clipped-gui --settings  the settings window only (one at a time)
 
 mod config;
 mod icons;
@@ -22,15 +22,15 @@ fn main() {
         Some("--open") => run_tray(true),
         Some("--settings") => run_settings(),
         Some("--version") => {
-            println!("clip-gui {}", env!("CARGO_PKG_VERSION"));
+            println!("clipped-gui {}", env!("CARGO_PKG_VERSION"));
             0
         }
         Some("-h" | "--help") => {
-            println!("Usage: clip-gui [--open | --settings | --version]");
+            println!("Usage: clipped-gui [--open | --settings | --version]");
             0
         }
         Some(a) => {
-            eprintln!("clip-gui: unknown option {a}");
+            eprintln!("clipped-gui: unknown option {a}");
             2
         }
     };
@@ -39,7 +39,7 @@ fn main() {
 
 /// Hold an exclusive flock on RUNDIR/NAME for the life of the process,
 /// or None if another process has it. Rust opens files close-on-exec, so
-/// the lock never leaks into clip or the recorder.
+/// the lock never leaks into clipped or the recorder.
 fn take_lock(name: &str) -> Result<Option<File>, String> {
     let dir = state::ensure_rundir()?;
     let f = File::create(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
@@ -54,7 +54,7 @@ fn run_tray(open_settings: bool) -> i32 {
     let lock = match take_lock("gui.lock") {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("clip-gui: {e}");
+            eprintln!("clipped-gui: {e}");
             return 1;
         }
     };
@@ -80,7 +80,7 @@ fn run_settings() -> i32 {
         }
         Ok(None) => 0, // a settings window is already open
         Err(e) => {
-            eprintln!("clip-gui: {e}");
+            eprintln!("clipped-gui: {e}");
             1
         }
     }
@@ -89,7 +89,7 @@ fn run_settings() -> i32 {
 pub fn spawn_settings() {
     match std::env::current_exe() {
         Ok(exe) => spawn_detached(Command::new(exe).arg("--settings")),
-        Err(e) => eprintln!("clip-gui: {e}"),
+        Err(e) => eprintln!("clipped-gui: {e}"),
     }
 }
 
@@ -102,19 +102,19 @@ pub fn spawn_detached(cmd: &mut Command) {
         Ok(mut child) => {
             std::thread::spawn(move || child.wait());
         }
-        Err(e) => eprintln!("clip-gui: cannot run {:?}: {e}", cmd.get_program()),
+        Err(e) => eprintln!("clipped-gui: cannot run {:?}: {e}", cmd.get_program()),
     }
 }
 
-/// bin/clip: $CLIP_BIN, then `clip` next to this binary, then the repo
-/// layout (gui/target/<profile>/clip-gui -> bin/clip), then PATH.
+/// bin/clipped: $CLIPPED_BIN, then `clipped` next to this binary, then the repo
+/// layout (gui/target/<profile>/clipped-gui -> bin/clipped), then PATH.
 pub fn clip_bin() -> PathBuf {
-    if let Some(p) = std::env::var_os("CLIP_BIN").filter(|p| !p.is_empty()) {
+    if let Some(p) = std::env::var_os("CLIPPED_BIN").filter(|p| !p.is_empty()) {
         return PathBuf::from(p);
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for c in [dir.join("clip"), dir.join("../../../bin/clip")] {
+            for c in [dir.join("clipped"), dir.join("../../../bin/clipped")] {
                 if is_exec(&c) {
                     return c.canonicalize().unwrap_or(c);
                 }
@@ -123,13 +123,13 @@ pub fn clip_bin() -> PathBuf {
     }
     if let Some(path) = std::env::var_os("PATH") {
         for d in std::env::split_paths(&path) {
-            let c = d.join("clip");
+            let c = d.join("clipped");
             if is_exec(&c) {
                 return c;
             }
         }
     }
-    PathBuf::from("clip")
+    PathBuf::from("clipped")
 }
 
 fn is_exec(p: &Path) -> bool {
@@ -137,7 +137,7 @@ fn is_exec(p: &Path) -> bool {
     p.metadata().map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
 }
 
-/// `clip ARGS…` detached (screenshots, record, replay, service).
+/// `clipped ARGS…` detached (screenshots, record, replay, service).
 pub fn clip_detached(args: &[&str]) {
     spawn_detached(Command::new(clip_bin()).args(args));
 }
@@ -178,7 +178,7 @@ pub mod testutil {
     pub fn tempdir(tag: &str) -> TempDir {
         static N: AtomicU32 = AtomicU32::new(0);
         let d = std::env::temp_dir().join(format!(
-            "clip-gui-test-{}-{tag}-{}",
+            "clipped-gui-test-{}-{tag}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
@@ -186,7 +186,7 @@ pub mod testutil {
         TempDir(d)
     }
 
-    /// Tests that set process-wide env vars (XDG_*, CLIP_*) hold this.
+    /// Tests that set process-wide env vars (XDG_*, CLIPPED_*) hold this.
     pub fn env_lock() -> MutexGuard<'static, ()> {
         static L: Mutex<()> = Mutex::new(());
         L.lock().unwrap_or_else(|e| e.into_inner())

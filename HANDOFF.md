@@ -1,12 +1,47 @@
-# HANDOFF — clip
+# HANDOFF — Clipped (repo folder still `clip`)
 
 ## Goal
 
 Background screenshot / replay / recording tool driven by global
-shortcuts, one config file; `bin/clip` is the engine, `clip-gui` (Rust)
-an optional tray + settings window. Saves to `<save_dir>/clip/images` and
+shortcuts, one config file; `bin/clipped` is the engine, `clipped-gui`
+(Rust) an optional tray + settings window. Saves to
+`<save_dir>/clipped/images` and
 `/videos`, copies to the clipboard, works on KDE, GNOME, Hyprland, Sway
 and X11. MIT, all our own code (no Hyprshot code).
+
+## Rename to Clipped (2026-10-17, Kevin asked; Atlas did it, Sora checked)
+
+Kevin renamed the app "clip" -> "Clipped" to avoid clashing with other
+apps. Everything user-facing moved: `bin/clipped`, crate/binary
+`clipped-gui`, `~/.config/clipped/config`, `<save_dir>/clipped/…`,
+XDG state/cache/runtime dirs `clipped`, `clipped.service`,
+`clipped-<action>.desktop`, kglobalaccel "clipped region" etc.,
+`notify-send -a clipped`, `clipped.desktop` (Name=Clipped),
+`clipped-gui.desktop` autostart, manifest `share/clipped/installed`,
+icons `gui/icons/clipped*`, env vars `CLIPPED_*` (was `CLIP_*`). No
+migration code: nothing of the old name existed in Kevin's home (checked
+~/.config, ~/Documents, state, cache, applications, systemd user dir,
+kglobalshortcutsrc). Kept: the repo folder name `clip` (Workspace
+project path), internal Rust names (`ClipTray`, `run_clip`), and the
+replay toast "Clip saved (N s)" (a video clip). Older sections below
+use the old names; read them as clipped / CLIPPED_.
+
+Sora's check: `git grep -nIiw clip` outside HANDOFF = only the toast
+line and its smoke assertion; `git grep CLIP_` = none. `bash -n
+bin/clipped` ok; `bash tests/smoke.sh` "95 checks, all passed"; `cargo
+test` "29 passed"; dry `--detect` shows images=~/Documents/clipped/images
+and did not create it. Atlas also ran clippy (0 warnings), release
+build (6,601,768 bytes) and DESTDIR install (13 files incl. manifest) +
+uninstall (left: 0). Stale `gui/target/release/clip-gui` is ignored
+build output.
+
+GPU encoding (Kevin asked): recording/replay use gpu-screen-recorder
+6.1.4 without `-encoder`, so it encodes on the GPU (on AMD/Intel via
+VAAPI, NVENC on NVIDIA — from gsr docs). Capture is GPU-side too.
+`gpu-screen-recorder --info` here: AMD RX 9070 (card1), codecs h264,
+hevc, av1 (+ _hdr/_10bit, _vulkan variants, h264_software); auto picks
+av1. Only the X11 ffmpeg fallback (used when gsr is missing) is CPU
+(libx264 / libvpx-vp9); a VAAPI ffmpeg path is a possible follow-up.
 
 ## Current state (2026-10-17, 0.2.0 = round 3: GUI + Nova's review fixes, committed after Sora's review)
 
@@ -342,4 +377,5 @@ GUI below plus fixes for Nova's round-3 review (next section).
 - clip round 3 (2026-10-17, Atlas, uncommitted for Sora's review): Rust GUI in gui/ (clip-gui 0.1.0: eframe 0.33.3 glow + ksni 0.3.6 tray + png + rfd), tray and settings are separate processes with flock gui.lock/settings.lock in RUNDIR. bin/clip got `clip check`. install.sh (PREFIX, DESTDIR, --no-build, --uninstall; 12 files). smoke.sh = 89 checks, cargo test = 19. egui can't see Meta on Linux, so shortcut Record has an "add Meta" box. CLIP_GUI_SHOT=f.png makes the settings window save its own frame. Nothing installed into real ~/.local yet. (Atlas, 2026-10-17)
 - clip round 3 review fixes (2026-10-17, Atlas, uncommitted): all of Nova's 10 items are fixed. The GUI config parser/writer now works on bytes (lossless for non-UTF-8). Only NotFound counts as "no config"; any other read error turns Save off. bash load_config/parse_shortcut use local LC_ALL=C. bind/unbind are flocked on $RUNDIR/bind.lock. install.sh writes a manifest at $PREFIX/share/clip/installed; uninstall removes only what it lists and, without DESTDIR, stops clip-gui, runs service off + unbind and removes our autostart entry. Install refuses a foreign bin/clip unless --force. smoke = 95 checks, cargo test = 29. GUI tests use testutil::env_lock + test_env (dry run). Never run a real-mode install.sh --uninstall in tests without a fake bin/clip. (Atlas, 2026-10-17)
 - clip 0.2.0 committed 2026-10-17 (884e8d6, local): Rust clip-gui in gui/ (eframe settings window + ksni tray showing idle/replay/recording from RUNDIR pid files), install.sh (PREFIX/DESTDIR, manifest, --uninstall, --force), Clip start-menu entry (Exec=clip-gui --open), "Start tray at login" checkbox writes autostart. GUI validates via `clip check` before atomic rename. Checks: smoke 95, cargo test 29. Not installed for real yet; Kevin runs ./install.sh. (Sora, 2026-10-18)
+- clip renamed to clipped (2026-10-17, Atlas, uncommitted for Sora's review): bin/clipped, clipped-gui crate/binary, gui/icons/clipped*.svg/png, config ~/.config/clipped/config, <save_dir>/clipped/{images,videos}, XDG dirs .../clipped, clipped.service, KDE clipped-<action>.desktop, notify -a clipped, Name=Clipped, manifest share/clipped/installed, env CLIPPED_* (DRY_RUN, CONFIG, BIN, GUI_SHOT, BIND_WAIT, STOP_WAIT). Repo folder stays /home/kevin/Workspace/clip. Window/tray titles "Clipped"; "Clip saved" toast (video clip) kept. Checks after rename: smoke 95 pass, cargo test 29 pass, clippy clean. (Atlas, 2026-10-18)
 <!-- workspace:memory:end -->

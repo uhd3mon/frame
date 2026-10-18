@@ -1,9 +1,9 @@
-//! The clip config file: same reading rules as `load_config` in bin/clip,
+//! The clipped config file: same reading rules as `load_config` in bin/clipped,
 //! and a writer that changes only the values it has to.
 
 use std::collections::BTreeMap;
 
-/// Keys and defaults, in the order of `default_config()` in bin/clip.
+/// Keys and defaults, in the order of `default_config()` in bin/clipped.
 pub const DEFAULTS: &[(&str, &str)] = &[
     ("save_dir", "~/Documents"),
     ("image_format", "png"),
@@ -139,7 +139,7 @@ pub fn format_value(value: &str) -> String {
 pub fn apply(text: &[u8], changes: &BTreeMap<String, String>) -> Result<Vec<u8>, String> {
     for (k, v) in changes {
         if let Some(why) = unrepresentable(v) {
-            return Err(format!("{k}: value {why}; clip can't read that back"));
+            return Err(format!("{k}: value {why}; clipped can't read that back"));
         }
     }
     let mut out = Vec::with_capacity(text.len() + 64);
@@ -189,7 +189,7 @@ pub fn apply(text: &[u8], changes: &BTreeMap<String, String>) -> Result<Vec<u8>,
     Ok(out)
 }
 
-/// Same rule as `parse_shortcut` in bin/clip: modifiers plus one key.
+/// Same rule as `parse_shortcut` in bin/clipped: modifiers plus one key.
 pub fn valid_shortcut(s: &str) -> bool {
     let s: String = s.chars().filter(|c| !c.is_ascii() || !is_sp(*c as u8)).collect();
     if s.is_empty() || s.ends_with('+') {
@@ -233,7 +233,7 @@ fn known_key(k: &str) -> bool {
     false
 }
 
-/// Would `validate_config` in bin/clip accept V for KEY on its own?
+/// Would `validate_config` in bin/clipped accept V for KEY on its own?
 /// (Free-text keys and the webm/codec pair aren't checked here.)
 pub fn valid_value(key: &str, v: &str) -> bool {
     let int_in = |lo: u64, hi: u64| {
@@ -256,7 +256,7 @@ pub fn valid_value(key: &str, v: &str) -> bool {
     }
 }
 
-/// Same as bin/clip `yes_`.
+/// Same as bin/clipped `yes_`.
 pub fn yes(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1")
 }
@@ -420,8 +420,8 @@ mod tests {
     /// as space.
     #[test]
     fn bash_reads_what_we_write() {
-        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../bin/clip");
-        if !clip.exists() || std::process::Command::new("bash").arg("-c").arg("true").status().is_err() {
+        let clipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../bin/clipped");
+        if !clipped.exists() || std::process::Command::new("bash").arg("-c").arg("true").status().is_err() {
             return;
         }
         let dir = crate::testutil::tempdir("bashrt");
@@ -432,8 +432,8 @@ mod tests {
                 .arg("-c")
                 .arg(r#"source "$1"; load_config 2>/dev/null; printf %s "${CFG[audio]}""#)
                 .arg("_")
-                .arg(&clip)
-                .env("CLIP_CONFIG", &cfg)
+                .arg(&clipped)
+                .env("CLIPPED_CONFIG", &cfg)
                 .env("HOME", &*dir)
                 .env("LC_ALL", "en_US.UTF-8")
                 .output()
