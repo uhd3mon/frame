@@ -2,14 +2,92 @@
 
 ## Goal
 
-Background screenshot / replay / recording tool driven by global
-shortcuts, one config file; `bin/frame` is the engine, `frame-gui`
-(Rust) the tray + settings window, and the tray running = Frame running
-(it keeps the daemon and replay buffer alive). Saves to
-`<save_dir>/frame/images` and `/videos`, copies to the clipboard, works
-on KDE, GNOME, Hyprland, Sway and X11. MIT, all our own code (no
-Hyprshot code). Sections below this one are history and use the old
-names (clip, clipped).
+Screenshot tool driven by global shortcuts, one config file; `bin/frame`
+is the engine, `frame-gui` (Rust) the tray + settings window. Saves to
+`<save_dir>/frame/images`, copies to the clipboard, works on KDE, GNOME,
+Hyprland, Sway and X11. MIT, all our own code (no Hyprshot code).
+Pictures only since 0.4.0 (Kevin, 2026-10-29). Sections below the 0.4.0
+one are history and use old names (clip, clipped) and video features.
+
+## Frame 0.4.0: pictures only (2026-10-29, uncommitted)
+
+Kevin asked to remove every video feature. Removed: replay buffer,
+recording, gpu-screen-recorder, `frame daemon` / `service` / `monitors`
+/ `replay` / `record` / `_saved`, gui/src/daemon.rs (the tray no longer
+supervises anything; it runs `frame bind` once at start). Kept for
+upgrades: bin/frame ignores 0.3's video keys silently (`OLD_KEYS`, other
+unknown keys still warn) and bind/unbind remove 0.3's replay/record
+shortcuts (`OLD_ACTIONS`); a real install/uninstall turns off and
+removes 0.3's frame.service (systemctl --user) and the
+frame-replay/record .desktop entries. Strata is redoing the settings
+window (settings.rs, theme.rs) in parallel.
+
+- tests/smoke.sh rewritten for pictures only (Atlas): video, daemon and
+  service checks removed; new checks: removed commands exit 2, default
+  config has only picture keys, old video keys ignored silently,
+  unknown key still warned, bind/unbind drop 0.3 replay/record (KDE
+  state + leftover .desktop, Hyprland, GNOME frame-replay path), status
+  tray pid (live vs reused PID), install.sh --help, install removes
+  0.3's service/shortcuts (fake systemctl; DESTDIR leaves them). A fake
+  systemctl is always first on PATH.
+- The 3 old install/uninstall failures were test expectations (no more
+  `service off` on uninstall; autostart Comment is now "Frame tray:
+  screenshot shortcuts", same as settings.rs). Real bug fixed:
+  `install.sh --help` printed only lines 2-20 and cut the header; it
+  now prints the whole comment block.
+- README and AGENTS.md describe a screenshot-only tool.
+- Checks (Atlas, 2026-10-29): `bash -n bin/frame` ok; smoke "100
+  checks, all passed"; cargo test "46 passed; 0 failed"; clippy
+  --all-targets 0 warnings. Mutation check: breaking OLD_KEYS,
+  OLD_ACTIONS or the --help fix makes the matching smoke checks fail.
+- Nova review fixes (Atlas, 2026-10-29): a live install now stops the
+  running Frame before copying: frame-gui by /proc exe (also
+  "PATH (deleted)", a tray left from an earlier install) and 0.3's
+  `frame daemon` / recorders from $RUNDIR daemon.pid, record.pid,
+  replay.pid (pid + start time must match; INT for recorders, TERM after
+  10 s; TERM for the daemon). Afterwards it starts the new tray
+  (`setsid -f`, no output) if tray.pid was live or our autostart entry is
+  on; with no WAYLAND_DISPLAY/DISPLAY it prints a note instead. Our
+  autostart entry gets today's Comment. KDE bind/unbind always unbind
+  replay/record (install deletes their .desktop files first). `frame
+  status` lists only picture shortcuts.
+- smoke install checks now run install.sh from a copied source tree
+  ($T/src) whose "built" frame-gui only logs its start, so no install in
+  a test can start the real tray (and they no longer need a release
+  build). Background sleeps ignore INT, so the fake recorder is python.
+- Checks: bash -n ok (3 scripts); smoke "103 checks, all passed"; cargo
+  test "46 passed"; clippy --all-targets 0 warnings; no test processes
+  left running.
+- Settings window v2 (Strata): design/theme-v2.rs moved into
+  gui/src/theme.rs (v1 card/row/toggle_label/keycaps removed), settings.rs
+  rebuilt to design/gui.md: 480x700, Shortcuts glyph rows open the editor
+  listening, "Turn on" notice, Save to (Open/Change…, not typeable),
+  PNG|JPG|WebP segmented, Behaviour toggles, editor 380 wide with Clear
+  shortcut. Modal fade-in disabled (egui's ~80 ms fade made the dialog
+  look see-through in FRAME_GUI_SHOT frames). Shots:
+  shots/frame-settings-v2*.png, frame-shortcut-editor-v2.png (gitignored).
+  FRAME_GUI_SHOT works from an agent shell with
+  WAYLAND_DISPLAY=/run/user/1000/wayland-1.
+
+### Sora's check + real install (2026-10-29 ~13:15)
+
+- Re-ran: bash -n bin/frame + install.sh ok; smoke "103 checks, all
+  passed"; cargo test "46 passed"; clippy clean.
+- `./install.sh` (real): stopped the 0.3 tray (pid 2455); its daemon and
+  gsr went with it (pgrep finds no frame/gpu-screen-recorder after);
+  removed frame-replay/record.desktop; updated autostart. The agent shell
+  has no WAYLAND_DISPLAY, so install printed the "starts at next login"
+  note; Sora started the tray with WAYLAND_DISPLAY=wayland-1 setsid -f.
+  `frame status`: shortcuts region window monitor all, tray running.
+- kglobalaccel: frame_{region,window,monitor,all}_desktop isActive true;
+  frame_replay/record objects no longer exist.
+- Real grabs with the installed build into scratch (clipboard/notify
+  off): monitor 2560x1440, all 2560x2880; Spectacle didn't run.
+- Not tested: real key presses (shortcut fires, Record dialog), region
+  drag, tray menu clicks, the settings window opened from the start menu.
+- Workspace's project folder is still ~/Workspace/clip, which only holds
+  a stale HANDOFF.md + tmp/; the repo is ~/Workspace/frame. Kevin should
+  point the Workspace project at ~/Workspace/frame.
 
 ## Published on GitHub (2026-10-18)
 

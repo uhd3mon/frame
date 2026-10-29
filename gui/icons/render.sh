@@ -4,7 +4,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-names=(frame frame-idle frame-replay frame-recording)
+names=(frame frame-tray frame-idle frame-replay frame-recording)
+# Shown in preview.png (the old replay/recording states go in round 2).
+preview_names=(frame frame-tray)
 sizes=(16 22 24 32 48 64)
 
 mkdir -p png
@@ -26,7 +28,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 strip() { # bg out
     local bg=$1 out=$2 rows=() n s cells
-    for n in "${names[@]}"; do
+    for n in "${preview_names[@]}"; do
         cells=()
         for s in 16 22 32 64; do
             magick -size 72x72 "xc:$bg" "png/$n-$s.png" -gravity center \

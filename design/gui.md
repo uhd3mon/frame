@@ -1,105 +1,135 @@
 # Frame GUI design
 
-Target look: `design/settings-mockup.png`. That image is a real egui frame
-drawn with `gui/src/theme.rs` (from a scratch crate, not the app), so every
-widget in it already exists in theme.rs.
+Frame is a screenshot tool only (video removed 2026-10-28). Target look:
+`design/settings-v2.png` (normal state) and `design/settings-v2-states.png`
+(left: not running + shortcuts never turned on; right: shortcut editor).
+Both are real egui 0.33.3 frames drawn with `gui/src/theme.rs` plus the
+proposed widgets in `design/theme-v2.rs`, rendered at 2× (960×1400 px for
+a 480×700 pt window). The v1 look (`settings-mockup.png`) is superseded.
 
-Icons: `gui/icons/frame*.svg` → `gui/icons/png/` via `render.sh`;
-`gui/icons/preview.png` shows every size on Breeze dark and light.
+Icons: `gui/icons/frame.svg` (app) and `gui/icons/frame-tray.svg` (tray,
+the only tray state) → `gui/icons/png/` via `render.sh`;
+`gui/icons/preview.png` shows both at 16/22/32/64 on Breeze dark and light.
 
-## Settings window layout
+## Settings window (v2)
 
-Width about 600 px, minimum 520. Three regions:
+Window **480 × 700** (`with_inner_size([480.0, 700.0])`), minimum
+**440 × 520**; below 700 tall the body scrolls, header and bottom bar stay.
+No card titles inside cards: group titles sit above list cards, and
+rows are separated by hairlines. Three regions:
 
-1. **Header** (top panel, `theme::page_frame()`):
-   app icon 36 px · "Frame" (19 px, strong) over the muted line "Screenshots,
-   replay and recording" · right-aligned `status_pill`:
-   - `Replay on · 60 s` – ACCENT dot (same blue as the tray's replay dot)
-   - `Recording · 0:42` – RED dot
-   - `Replay off` – TEXT_FAINT dot
-   The pill is read from the same pid files the tray uses.
-2. **Body** (central panel, `page_frame()` + vertical `ScrollArea`):
-   four `theme::card`s, 12 px apart, in this order:
-   - **Saving** – Save folder (text field + Browse…), Image format,
-     Video format, "After capture": toggles *Copy to clipboard* and
-     *Notification with preview* (second toggle on a row with an empty label).
-   - **Video & replay** – Replay buffer toggle *Always on while Frame
-     runs*; Replay length (DragValue in s, disabled when *Auto (by free
-     RAM)* is on); Source; Frame rate; Quality; Codec; Audio. The
-     "Restart service" offer appears as a hint + secondary button at the
-     bottom of this card.
-   - **Shortcuts** – one row per action: `keycaps` (180 px wide, "Not set"
-     when empty) · Record · Clear. While recording, the Record button
-     becomes the accent `primary_button("Stop")` and the keycaps show the
-     live keys. Hint at the bottom. "Turn on shortcuts" (when never
-     bound) is a `primary_button` at the top of this card.
-   - **Startup** – *Start Frame at login (tray + replay)*, hint "Frame
-     comes back with your saved settings and replay buffer."
-   Config path and validation errors: a `hint` under the card the bad
-   key belongs to (error text in RED), not a line at the top of the window.
-3. **Bottom bar** (bottom panel, `theme::bottom_bar_frame()`, always
-   visible): left: AMBER dot + "Unsaved changes" (hidden when clean);
-   right: `primary_button("Save")` then `secondary_button("Revert")`.
-   Both disabled when there is nothing to save (Save turns grey).
+1. **Header** (top panel, BG fill, margin 20 left/right, 16 top, 4 bottom,
+   no separator): app icon 34 pt (`frame-128.png` texture) · 4 pt ·
+   "Frame" (18, strong, TEXT) over "Screenshots on a shortcut" (12,
+   TEXT_FAINT) · right-aligned `status_pill`:
+   - `Running` – GREEN dot (tray process up: `tray.pid` live)
+   - `Not running` – TEXT_FAINT dot
+2. **Body** (central panel, BG, margin 16 left/right, 8 top, 12 bottom,
+   vertical `ScrollArea`, item spacing y 6). Groups, each a
+   `group_title` then a `list_card`, 6 pt extra between groups:
+   - **Shortcuts** – four clickable rows with glyph tiles:
+     Region, Window, Monitor, All monitors. Right side:
+     `keycaps_compact` (or faint italic "Not set") then a chevron.
+     Clicking anywhere on the row (or Enter/Space when focused) opens the
+     shortcut editor already listening. No per-row Record/Clear buttons.
+     When shortcuts were never bound, a `notice` strip is the card's first
+     row: AMBER dot + "Shortcuts aren't turned on yet" + `primary_button`
+     "Turn on" (runs `frame bind`).
+   - **Saving** – row "Save to" with subtitle `<save_dir>/frame/images`
+     (`~` for $HOME), right: `compact_button` "Open" (xdg-open the images
+     folder, creating it first) and "Change…" (rfd folder picker writes
+     `save_dir`). Row "Format": `segmented` PNG | JPG | WebP writing
+     `png|jpg|webp`.
+   - **Behaviour** – toggle rows (toggle on the right):
+     "Copy to clipboard"; "Show a notification" / "With a preview of the
+     picture"; "Start Frame at login" / "Lives in the tray, keeps
+     shortcuts on" (autostart entry).
+   Validation errors: a red `hint` directly under the card that owns the
+   bad key; config path/"no config yet" goes in the bottom bar text.
+3. **Bottom bar** (bottom panel, CARD fill, margin 16×10, **no box
+   stroke, a 1 px BORDER hairline on top only**): left: AMBER 8 pt dot +
+   "Unsaved changes" (13, TEXT_MUTED), or "All changes saved"
+   (TEXT_FAINT), or a status/error line (GREEN "Saved.", RED errors).
+   Right: `primary_button("Save")`, then `secondary_button("Revert")`
+   to its left. Both disabled when clean.
+
+### Shortcut editor (modal)
+
+Same dialog as v1 (`settings.rs editor_dialog`) with three changes:
+width 380 (fits the 480 window), the combo shown with `keycaps_compact`,
+and a **"Clear shortcut"** `danger_link` bottom-left (writes an empty
+binding, closes) opposite Cancel / Set. Everything else (Record/Stop,
+Esc cancels, Meta/Ctrl/Alt/Shift chips + key combo, hint) stays.
+
+### Row metrics
+
+| Item | Size |
+|---|---|
+| One-line row (`ROW_H`) | 44 pt |
+| Row with subtitle (`ROW_H_TALL`) | 54 pt |
+| Row padding left/right (`ROW_PAD_X`) | 14 pt |
+| Title / subtitle | 14 TEXT / 12 TEXT_FAINT, 3 pt apart |
+| Glyph tile | 28 pt, radius 7, ACCENT at 16 %; 16 pt glyph, 1.6 stroke, ACCENT_HOVER |
+| Hairline | 1 px BORDER, from the text column (after the tile) to the card's right edge |
+| Row hover / focus | inset 4, radius 8, CONTROL at 70 %; focus adds a 1.5 ACCENT_HOVER ring |
+| Chevron | 3×10 pt, 1.6 stroke, TEXT_FAINT (TEXT_MUTED on hover), 18 pt reserved |
+| Keycap | 24 tall, min 24 wide, 8 side padding, radius 6, CONTROL + BORDER_STRONG edge, 2 pt FIELD lip, 12.5 text, 4 apart |
+| Segmented | 30 tall, 58 per segment, 3 inset; track FIELD + BORDER; selected CONTROL_ACTIVE + BORDER_STRONG, TEXT; others TEXT_MUTED, hover CONTROL |
+| Compact button | 28 tall, padding 10×4, 13 text |
+| Group title | 13 strong TEXT_MUTED, sentence case, 4 pt indent |
 
 Rules:
-- Every row is `theme::row(ui, label, …)`: 132 px label column
-  (`LABEL_WIDTH`), so controls line up across all cards.
-- On/off settings use `theme::toggle_label`, never checkboxes.
-- Combo boxes 200 px wide. Show friendly text ("Very high", "MP4",
-  "Desktop audio", "Auto (AV1)") while writing the raw config values.
-- Card titles are `section_header` (upper case, 11.5 px, TEXT_MUTED).
-- No separators; cards and spacing do the grouping.
-
-## As built (phase 2, settings.rs)
-
-- Bottom bar order is Revert then Save (Save rightmost); status text
-  (red error, green "Saved.", muted otherwise) wraps above the buttons.
-- Record on a shortcut row opens the shortcut editor dialog (themed
-  `egui::Modal`, CARD fill, BORDER_STRONG edge, 20 px padding) already
-  listening; it shows the combo as keycaps in a FIELD box (ACCENT edge
-  while listening), Record/Stop, Meta/Ctrl/Alt/Shift chips + key combo,
-  then Cancel / accent Set. No "Restart service" button (the tray
-  restarts the daemon itself).
-- Status pill also has "Starting…" (AMBER: tray up, daemon not yet) and
-  "Not running" (TEXT_FAINT). Real shots: `shots/frame-settings*.png`,
-  `shots/frame-shortcut-editor.png`.
+- On/off settings are `toggle`s on the right of a row; never checkboxes.
+- Labels are sentence case and short; explanations go in the subtitle,
+  not in hints under the card.
+- Hairlines only inside list cards; spacing groups the cards.
+- Show friendly text (PNG, WebP) while writing raw config values.
 
 ## Colours (dark theme)
 
 | Token | Hex | Use |
 |---|---|---|
 | BG | `#15171C` | window / page background |
-| FIELD | `#111317` | text fields, sunken areas |
+| FIELD | `#111317` | text fields, segmented track, keycap lip |
 | CARD | `#1D2027` | cards, bottom bar, popups |
 | CONTROL | `#272B34` | buttons, combos, keycaps, toggle off |
 | CONTROL_HOVER | `#303540` | hovered control |
-| CONTROL_ACTIVE | `#383E4A` | pressed / open control |
-| BORDER | `#2B2F38` | card + control outlines |
+| CONTROL_ACTIVE | `#383E4A` | pressed / open control, selected segment |
+| BORDER | `#2B2F38` | card outlines, hairlines |
 | BORDER_STRONG | `#3A404C` | hovered outline, keycap edge |
 | TEXT | `#E6E9EF` | body text |
-| TEXT_MUTED | `#9AA2B1` | card titles, secondary text |
-| TEXT_FAINT | `#6B7380` | hints, "Not set" |
-| ACCENT | `#3D8BFF` | Save, toggles on, focus, replay status |
-| ACCENT_HOVER | `#5A9CFF` | hovered accent, links |
+| TEXT_MUTED | `#9AA2B1` | group titles, secondary text |
+| TEXT_FAINT | `#6B7380` | subtitles, hints, "Not set" |
+| ACCENT | `#3D8BFF` | Save, toggles on, focus, glyph tiles |
+| ACCENT_HOVER | `#5A9CFF` | hovered accent, glyphs, focus rings |
 | ACCENT_PRESSED | `#2F74E0` | pressed accent |
-| RED | `#F0414B` | recording, errors |
-| GREEN | `#34C77B` | success ("Saved") |
-| AMBER | `#F5B544` | unsaved changes, warnings |
+| RED | `#F0414B` | errors, Clear hover |
+| GREEN | `#34C77B` | "Running", "Saved." |
+| AMBER | `#F5B544` | unsaved changes, "shortcuts off" notice |
 
 App icon gradient `#5A9CFF` → `#1F5BD8` (top-left to bottom-right),
-white marks. Tray: idle `#A8ADB4` marks; replay/recording `#FCFCFC` marks
-with a `#3D8BFF` / `#F0414B` dot; all with a `#232629` outline so they
-read on Breeze dark and light panels.
+white marks. Tray (`frame-tray.svg`): viewfinder corners (2.75 stroke on a
+24 grid) + centre dot r 3.5, all `#FCFCFC`, with a thin `#232629` halo
+(4.25 under-stroke, 0.75 dot edge). Built for dark panels (Kevin's KDE);
+on light panels it still reads from 22 px up but looks outlined, and is
+weak at 16 px.
 
 Type: egui default font. Heading 20, Body/Button 14, Small 12,
-Monospace 13. Radius: controls 8, cards 12, pills fully round.
-Spacing: item 8×8, button padding 12×6, controls 30 px tall,
-card padding 16 (12 top).
+Monospace 13. Radius: controls 8, cards 12, keycaps 6, pills round.
+Spacing: item 8×8 (body y 6), button padding 12×6, controls 30 tall.
 
 ## theme.rs API
 
-`apply(ctx)` once at start-up (it sets the dark theme style).
-Widgets: `card`, `section_header`, `row`, `hint`, `primary_button`,
-`secondary_button`, `toggle`, `toggle_label`, `status_pill`, `keycaps`,
-`bottom_bar_frame`, `page_frame`; colour and size constants as above.
+v2 is implemented (2026-10-29) in `gui/src/settings.rs` on these:
+`apply(ctx)`, `section_header` (editor only), `hint`, `primary_button`,
+`secondary_button`, `compact_button`, `danger_link`, `toggle`,
+`status_pill`, `group_title`, `list_card`, `list_row` (+ `Glyph`,
+`paint_glyph`, `ROW_H`, `ROW_H_TALL`, `ROW_PAD_X`), `keycaps_compact`,
+`segmented`, `notice`, `bottom_bar_frame` (no stroke) + `top_hairline`,
+`page_frame`. The v1 `card`, `row`, `toggle_label`, `keycaps` and
+`LABEL_WIDTH` are gone. `list_row` lays out its right side first and
+cuts the title/subtitle with "…" to the space left (long save folders).
+
+Real frames of the built window: `shots/frame-settings-v2.png`,
+`shots/frame-settings-v2-off.png`, `shots/frame-settings-v2-invalid.png`,
+`shots/frame-shortcut-editor-v2.png` (1× scale; the mockups are 2×).

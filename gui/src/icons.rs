@@ -13,9 +13,8 @@ macro_rules! sizes {
     };
 }
 
+/// The tray icon.
 pub const IDLE: &[&[u8]] = sizes!("frame-idle");
-pub const REPLAY: &[&[u8]] = sizes!("frame-replay");
-pub const RECORDING: &[&[u8]] = sizes!("frame-recording");
 pub const APP_64: &[u8] = include_bytes!("../icons/png/frame-64.png");
 
 /// Decode a PNG to (width, height, RGBA8).
@@ -55,14 +54,12 @@ mod tests {
 
     #[test]
     fn all_icons_decode_at_their_size() {
-        for set in [IDLE, REPLAY, RECORDING] {
-            let icons = pixmaps(set);
-            let sizes: Vec<i32> = icons.iter().map(|i| i.width).collect();
-            assert_eq!(sizes, [16, 22, 24, 32, 48, 64]);
-            for i in &icons {
-                assert_eq!(i.width, i.height);
-                assert_eq!(i.data.len(), (i.width * i.height * 4) as usize);
-            }
+        let icons = pixmaps(IDLE);
+        let sizes: Vec<i32> = icons.iter().map(|i| i.width).collect();
+        assert_eq!(sizes, [16, 22, 24, 32, 48, 64]);
+        for i in &icons {
+            assert_eq!(i.width, i.height);
+            assert_eq!(i.data.len(), (i.width * i.height * 4) as usize);
         }
         assert_eq!(rgba(APP_64).map(|(w, h, _)| (w, h)), Some((64, 64)));
     }

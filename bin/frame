@@ -1,28 +1,25 @@
 #!/usr/bin/env bash
-# frame - screenshots, replay clips and recordings on any Linux desktop.
-# Runs in the background with global shortcuts (frame-gui adds a tray and
-# settings window). MIT licence.
+# frame - screenshots on any Linux desktop, taken with global shortcuts
+# (frame-gui adds a tray and settings window). MIT licence.
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 FRAME_BIN="$(readlink -f "${BASH_SOURCE[0]}")"
-ACTIONS=(region window monitor all replay record)
+ACTIONS=(region window monitor all)
+# Removed in 0.4.0 (Frame is pictures only). Their keys are ignored in old
+# configs, and `frame bind` / `unbind` still remove shortcuts bound for them.
+OLD_ACTIONS=(replay record)
+OLD_KEYS=" video_format replay replay_seconds video_source video_fps video_quality video_codec audio bind.replay bind.record "
 RUNDIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/frame-$UID}/frame"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/frame"
-THUMB_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/frame/thumbs"
 CONFIG="${FRAME_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/frame/config}"
-STOP_WAIT="${FRAME_STOP_WAIT:-10}"   # seconds a recorder gets to finish after INT
-[[ "$STOP_WAIT" =~ ^[0-9]+$ ]] || STOP_WAIT=10
 COPIED=0
 TMPD=""
 
 declare -A CFG=(
-    [save_dir]="~/Documents" [image_format]=png [video_format]=mp4
-    [clipboard]=true [notify]=true [replay]=true [replay_seconds]=auto
-    [video_source]=auto [video_fps]=60 [video_quality]=very_high
-    [video_codec]=auto [audio]=default_output
+    [save_dir]="~/Documents" [image_format]=png [clipboard]=true [notify]=true
     [bind.region]=Meta+Alt+R [bind.window]=Meta+Alt+W [bind.monitor]=Meta+Alt+M
-    [bind.all]=Meta+Alt+A [bind.replay]=Meta+Alt+C [bind.record]=Meta+Alt+V
+    [bind.all]=Meta+Alt+A
 )
 
 usage() {
@@ -30,19 +27,13 @@ usage() {
 Usage: frame <command>
 
 Screenshots:  region | window | monitor | all
-Video:        replay       save the last N seconds of the replay buffer
-              record       start / stop a recording
-Background:   daemon       apply shortcuts and run the replay buffer
-              bind|unbind  add / remove the global shortcuts
-              service on|off   run the daemon as a systemd user service
-                           (for setups without the frame-gui tray)
+Shortcuts:    bind|unbind  add / remove the global shortcuts
 Other:        status | config | --detect | --help | --version
               check        validate the config: prints ok, or exits 2
-              monitors     monitors you can record: NAME|WxH[|active]
 
 Config: ${XDG_CONFIG_HOME:-~/.config}/frame/config (env FRAME_CONFIG overrides).
-FRAME_DRY_RUN=1 prints capture, record, clipboard, notification and bind
-commands instead of running them.
+FRAME_DRY_RUN=1 prints capture, clipboard, notification and bind commands
+instead of running them.
 EOF
 }
 
@@ -92,20 +83,10 @@ default_config() {
 # after a space. Values may be quoted. Delete a line to use its default.
 # Only ~ and ~/ are expanded; $VARS are not.
 
-save_dir = ~/Documents     # files go to <save_dir>/frame/images and /frame/videos
+save_dir = ~/Documents     # screenshots go to <save_dir>/frame/images
 image_format = png         # png | jpg | webp
-video_format = mp4         # mp4 | webm | mkv
-clipboard = true           # copy each capture to the clipboard
+clipboard = true           # copy each screenshot to the clipboard
 notify = true              # notification with a preview (notify-send)
-
-replay = true              # keep a replay buffer running in the daemon
-replay_seconds = auto      # 5-1800; auto = 60 with >= 8 GiB free RAM, else 30
-video_source = auto        # auto = monitor you're on; or DP-1, portal, screen (X11)
-                           # (frame monitors lists them; replay picks at daemon start)
-video_fps = 60             # 1-240
-video_quality = very_high  # medium | high | very_high | ultra
-video_codec = auto         # auto = best the GPU encodes (av1 > hevc > h264)
-audio = default_output     # gpu-screen-recorder -a value, or none
 
 # Shortcuts use KDE-style names: Meta, Ctrl, Alt, Shift + one key (a-z, 0-9,
 # F1-F35, Print, Space, Home, ...). Empty = none.
@@ -113,8 +94,6 @@ bind.region = Meta+Alt+R
 bind.window = Meta+Alt+W
 bind.monitor = Meta+Alt+M
 bind.all = Meta+Alt+A
-bind.replay = Meta+Alt+C
-bind.record = Meta+Alt+V
 EOF
 }
 
@@ -143,32 +122,23 @@ load_config() {
             fi
             key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
             if [[ "$val" =~ ^\"(.*)\"$ || "$val" =~ ^\'(.*)\'$ ]]; then val="${BASH_REMATCH[1]}"; fi
-            if [[ -z "${CFG[$key]+x}" ]]; then warn "$CONFIG:$n: unknown key '$key'"; continue; fi
+            if [[ -z "${CFG[$key]+x}" ]]; then
+                # Video settings from before 0.4.0: ignored without a word.
+                [[ "$OLD_KEYS" == *" $key "* ]] || warn "$CONFIG:$n: unknown key '$key'"
+                continue
+            fi
             CFG[$key]="$val"
         done <"$CONFIG"
     fi
     validate_config
 }
 
-int_in() { [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= $2 && 10#$1 <= $3)); }
-
 validate_config() {
     local a k
     [[ "${CFG[image_format]}" =~ ^(png|jpg|webp)$ ]] || die "image_format must be png, jpg or webp" 2
-    [[ "${CFG[video_format]}" =~ ^(mp4|webm|mkv)$ ]] || die "video_format must be mp4, webm or mkv" 2
-    for k in clipboard notify replay; do
+    for k in clipboard notify; do
         [[ "${CFG[$k],,}" =~ ^(true|false|yes|no|on|off|1|0)$ ]] || die "$k must be true or false" 2
     done
-    [[ "${CFG[replay_seconds]}" == auto ]] || int_in "${CFG[replay_seconds]}" 5 1800 \
-        || die "replay_seconds must be auto or 5-1800" 2
-    int_in "${CFG[video_fps]}" 1 240 || die "video_fps must be 1-240" 2
-    [[ "${CFG[video_quality]}" =~ ^(medium|high|very_high|ultra)$ ]] \
-        || die "video_quality must be medium, high, very_high or ultra" 2
-    [[ "${CFG[video_codec]}" =~ ^(auto|h264|hevc|av1|vp8|vp9|hevc_hdr|av1_hdr|hevc_10bit|av1_10bit)$ ]] \
-        || die "video_codec must be auto, h264, hevc, av1, vp8 or vp9 (or hevc/av1 _hdr/_10bit)" 2
-    if [[ "${CFG[video_format]}" == webm && ! "${CFG[video_codec]}" =~ ^(auto|av1|vp8|vp9)$ ]]; then
-        die "webm needs video_codec auto, av1, vp8 or vp9" 2
-    fi
     [[ "$(expand_dir "${CFG[save_dir]}")" == /* ]] \
         || die "save_dir must be an absolute path or start with ~/ (got '${CFG[save_dir]}')" 2
     for a in "${ACTIONS[@]}"; do
@@ -185,7 +155,6 @@ expand_dir() {
 }
 save_root() { echo "$(expand_dir "${CFG[save_dir]}")/frame"; }
 images_dir() { echo "$(save_root)/images"; }
-videos_dir() { echo "$(save_root)/videos"; }
 
 cmd_config() {
     if [[ ! -f "$CONFIG" ]]; then
@@ -248,91 +217,8 @@ clipboard_backend() {
     else echo none; fi
 }
 
-video_backend() {
-    if have gpu-screen-recorder; then echo gpu-screen-recorder
-    elif [[ "$(session_type)" == x11 ]] && have ffmpeg; then echo ffmpeg
-    else echo none; fi
-}
-
 bind_backend() {
     case "$(desktop)" in kde|hyprland|sway|gnome) desktop ;; *) echo manual ;; esac
-}
-
-replay_seconds() {
-    local s="${CFG[replay_seconds]}" kb
-    if [[ "$s" == auto ]]; then
-        kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
-        if (( ${kb:-0} >= 8 * 1024 * 1024 )); then s=60; else s=30; fi
-    fi
-    echo "$s"
-}
-
-# gpu-screen-recorder's monitors, one "NAME|WxH" per line.
-gsr_monitors() {
-    have gpu-screen-recorder || return 0
-    gpu-screen-recorder --list-monitors 2>/dev/null | grep -E '^[^|[:space:]]+[|]' || true
-}
-
-# The output KWin calls active (where the pointer / focus is), or nothing.
-kwin_active_output() {
-    local out t=()
-    have gdbus || return 0
-    have timeout && t=(timeout 3)
-    out="$("${t[@]}" gdbus call --session --timeout 2 -d org.kde.KWin -o /KWin \
-        -m org.kde.KWin.activeOutputName 2>/dev/null)" || return 0
-    [[ "$out" =~ ^\(\'([A-Za-z0-9_.:-]+)\',?\)$ ]] && echo "${BASH_REMATCH[1]}"
-    return 0
-}
-
-# The monitor you're on, where the desktop tells us; else nothing.
-active_monitor() {
-    case "$(desktop)" in
-        hyprland) hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null || true ;;
-        sway) swaymsg -t get_outputs 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null || true ;;
-        kde) kwin_active_output ;;
-    esac
-}
-
-# auto = the monitor you're on (checked when a recording / the replay
-# buffer starts), else the first one gpu-screen-recorder lists.
-video_source() {
-    local s="${CFG[video_source]}" list
-    [[ "$s" != auto ]] && { echo "$s"; return; }
-    s="$(active_monitor)"; s="${s%%$'\n'*}"
-    if [[ "$(desktop)" == kde || -z "$s" ]]; then
-        list="$(gsr_monitors | cut -d'|' -f1)"
-        # KWin's name must be one gsr can capture.
-        grep -qxF -- "$s" <<<"$list" || s="${list%%$'\n'*}"
-    fi
-    echo "${s:-screen}"
-}
-
-# frame monitors: what gpu-screen-recorder can capture, the active one marked.
-cmd_monitors() {
-    have gpu-screen-recorder || die "gpu-screen-recorder is not installed"
-    local m a; a="$(active_monitor)"
-    while IFS= read -r m; do
-        [[ -n "$m" ]] || continue
-        if [[ -n "$a" && "${m%%|*}" == "$a" ]]; then echo "$m|active"; else echo "$m"; fi
-    done <<<"$(gsr_monitors)"
-}
-
-# pick_codec CONTAINER CODEC_LIST: best size/quality codec the GPU encodes.
-pick_codec() {
-    local fmt="$1" list="$2" c prefs=(av1 hevc h264)
-    [[ "$fmt" == webm ]] && prefs=(av1 vp9 vp8)
-    for c in "${prefs[@]}"; do
-        grep -qx "$c" <<<"$list" && { echo "$c"; return; }
-    done
-    echo auto
-}
-
-video_codec() {
-    local c="${CFG[video_codec]}" list=""
-    [[ "$c" != auto ]] && { echo "$c"; return; }
-    have gpu-screen-recorder && list="$(gpu-screen-recorder --info 2>/dev/null \
-        | sed -n '/^section=video_codecs/,/^section=/p' | grep -v '^section=' || true)"
-    pick_codec "${CFG[video_format]}" "$list"
 }
 
 cmd_detect() {
@@ -340,26 +226,16 @@ cmd_detect() {
     echo "desktop=$(desktop)"
     echo "capture=$(capture_backend)"
     echo "clipboard=$(clipboard_backend)"
-    echo "video=$(video_backend)"
     echo "binds=$(bind_backend)"
     echo "config=$CONFIG"
     echo "images=$(images_dir)"
-    echo "videos=$(videos_dir)"
-    echo "replay_seconds=$(replay_seconds)"
-    echo "video_source=$(video_source)"
-    echo "video_codec=$(video_codec)"
 }
 
 # ------------------------------------------------------------ clipboard etc
 
 mime_of() {
-    case "${1##*.}" in
-        png) echo image/png ;; jpg) echo image/jpeg ;; webp) echo image/webp ;;
-        *) echo text/uri-list ;;
-    esac
+    case "${1##*.}" in jpg) echo image/jpeg ;; webp) echo image/webp ;; *) echo image/png ;; esac
 }
-
-is_video() { [[ "${1##*.}" =~ ^(mp4|webm|mkv)$ ]]; }
 
 # Percent-encode byte by byte, so UTF-8 names (Документы, é) come out right.
 urlencode() {
@@ -372,30 +248,20 @@ urlencode() {
 }
 file_uri() { echo "file://$(urlencode "$1")"; }
 
-# Images go in as image data; videos as a file:// URI so they paste as files.
+# The image goes in as image data.
 copy_file() {
     local f="$1" mime
     yes_ "${CFG[clipboard]}" || return 0
     mime="$(mime_of "$f")"
-    case "$(clipboard_backend):$mime" in
-        wl-copy:text/uri-list) run wl-copy --type text/uri-list "$(file_uri "$f")" ;;
-        xclip:text/uri-list)
-            if dry; then echo "+ xclip -selection clipboard -t text/uri-list <<< $(file_uri "$f")"
-            else xclip -selection clipboard -t text/uri-list <<<"$(file_uri "$f")"; fi ;;
-        wl-copy:*) run_in "$f" wl-copy --type "$mime" ;;
-        xclip:*) run xclip -selection clipboard -t "$mime" -i "$f" ;;
+    case "$(clipboard_backend)" in
+        wl-copy) run_in "$f" wl-copy --type "$mime" ;;
+        xclip) run xclip -selection clipboard -t "$mime" -i "$f" ;;
         *) warn "no clipboard tool (install wl-clipboard or xclip)"; return 0 ;;
     esac
     COPIED=1
 }
 
 # ----------------------------------------------------------- notifications
-
-# Plain notification (no preview), e.g. "Recording started".
-notify() {
-    yes_ "${CFG[notify]}" && have notify-send || return 0
-    run notify-send -a frame -i "${3:-camera-photo}" "$1" "$2" || true
-}
 
 notify_error() {
     yes_ "${CFG[notify]}" && have notify-send || return 0
@@ -406,19 +272,6 @@ notify_error() {
 fail() { notify_error "$1"; die "$1"; }
 
 markup() { local s="${1//&/"&amp;"}"; s="${s//</"&lt;"}"; echo "${s//>/"&gt;"}"; }
-
-# video_thumb FILE: print a PNG of a frame ~1 s in, 512 px wide.
-video_thumb() {
-    local f="$1" t
-    t="$THUMB_DIR/$(basename "${f%.*}").png"
-    if dry; then run ffmpeg -loglevel error -y -ss 1 -i "$f" -frames:v 1 -vf scale=512:-2 "$t" >&2; echo "$t"; return; fi
-    have ffmpeg || return 1
-    mkdir -p "$THUMB_DIR"
-    find "$THUMB_DIR" -type f -mtime +7 -delete 2>/dev/null || true
-    ffmpeg -loglevel error -y -ss 1 -i "$f" -frames:v 1 -vf scale=512:-2 "$t" </dev/null 2>/dev/null || true
-    [[ -s "$t" ]] || ffmpeg -loglevel error -y -i "$f" -frames:v 1 -vf scale=512:-2 "$t" </dev/null 2>/dev/null || true
-    [[ -s "$t" ]] && echo "$t"
-}
 
 show_in_folder() {
     gdbus call --session -d org.freedesktop.FileManager1 -o /org/freedesktop/FileManager1 \
@@ -435,19 +288,13 @@ notify_saved() {
 }
 
 # toast FILE TITLE COPIED. KDE gets x-kde-urls (thumbnail you can drag out,
-# like Spectacle); other servers get the image as image-path. Plasma has no
-# video thumbnailer by default, so videos also get our own frame there.
+# like Spectacle); other servers get the image as image-path.
 toast() {
-    local f="$1" title="$2" body thumb="" icon=camera-photo reply args=(-a frame)
+    local f="$1" title="$2" body reply args=(-a frame)
     body="$(markup "${f##*/}")"
     [[ "${3:-0}" == 1 ]] && body+=$'\nCopied to clipboard'
-    if is_video "$f"; then icon=video-x-generic; thumb="$(video_thumb "$f")" || thumb=""
-    else thumb="$f"; fi
-    if [[ "$(desktop)" == kde ]]; then
-        args+=(-i "$icon" -h "string:x-kde-urls:$(file_uri "$f")")
-        is_video "$f" && [[ -n "$thumb" ]] && args+=(-h "string:image-path:$thumb")
-    elif [[ -n "$thumb" ]]; then args+=(-h "string:image-path:$thumb")
-    else args+=(-i "$icon"); fi
+    if [[ "$(desktop)" == kde ]]; then args+=(-i camera-photo -h "string:x-kde-urls:$(file_uri "$f")")
+    else args+=(-h "string:image-path:$f"); fi
     grep -q -- --action <<<"$(notify-send --help 2>&1)" && args+=(-A open=Open -A "folder=Show in folder")
     args+=("$title" "$body")
     if dry; then run notify-send "${args[@]}"; return 0; fi
@@ -562,180 +409,6 @@ cmd_shot() {
     echo "$dest"
 }
 
-# ------------------------------------------------------------------- video
-
-# Pid files hold "PID STARTTIME" so a stale file never signals a reused PID.
-proc_start() {  # start time of PID: field 22 of /proc/PID/stat
-    local s f
-    s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
-    s="${s##*") "}"; read -ra f <<<"$s"
-    echo "${f[19]}"
-}
-
-gone() {  # PID has exited (or is a zombie)
-    local s
-    s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
-    s="${s##*") "}"; [[ "${s:0:1}" == Z ]]
-}
-
-write_pid() {  # write_pid FILE PID [extra lines...]
-    local f="$1" pid="$2"; shift 2
-    { echo "$pid $(proc_start "$pid" || true)"; for l; do echo "$l"; done; } >"$f"
-}
-
-live_pid() {  # print the PID in FILE if that same process still runs
-    local pid start
-    [[ -f "$1" ]] || return 1
-    read -r pid start _ <"$1" || return 1
-    [[ "$pid" =~ ^[0-9]+$ && -n "$start" ]] || return 1
-    [[ "$(proc_start "$pid")" == "$start" ]] || return 1
-    echo "$pid"
-}
-
-# gpu-screen-recorder runs this after each save: path, type.
-write_hook() {
-    ensure_rundir
-    printf '#!/bin/sh\nexec %s _saved "$@"\n' "$(quote "$FRAME_BIN")" >"$RUNDIR/hook"
-    chmod +x "$RUNDIR/hook"
-}
-
-gsr_args() {  # common gsr options for the configured source and quality
-    local args=(-w "$(video_source)" -c "${CFG[video_format]}" -k "$(video_codec)"
-        -f "${CFG[video_fps]}" -q "${CFG[video_quality]}" -sc "$RUNDIR/hook")
-    [[ "${CFG[audio]}" != none && -n "${CFG[audio]}" ]] && args+=(-a "${CFG[audio]}")
-    printf '%s\n' "${args[@]}"
-}
-
-ffmpeg_args() {  # ffmpeg_args FILE: X11 fallback recorder, one arg per line
-    local audio=0 args=(ffmpeg -loglevel error -f x11grab -framerate "${CFG[video_fps]}" -i "${DISPLAY:-:0}")
-    if [[ "${CFG[audio]}" != none && -n "${CFG[audio]}" ]]; then args+=(-f pulse -i @DEFAULT_MONITOR@); audio=1; fi
-    case "${CFG[video_format]}" in
-        webm) args+=(-c:v libvpx-vp9 -crf 32 -b:v 0 -deadline realtime -cpu-used 8 -row-mt 1)
-              ((audio)) && args+=(-c:a libopus -b:a 128k) ;;
-        *) args+=(-c:v libx264 -crf 20 -preset veryfast -pix_fmt yuv420p)
-           ((audio)) && args+=(-c:a aac -b:a 160k) ;;
-    esac
-    printf '%s\n' "${args[@]}" "$1"
-}
-
-# Hook target: give replays our name, then copy and notify.
-cmd_saved() {
-    local f="$1" type="${2:-regular}" dest secs
-    [[ -f "$f" ]] || dry || fail "saved file not found: $f"
-    if [[ "$type" == replay ]]; then
-        dest="$(new_file "$(videos_dir)" replay "${f##*.}")"
-        run mv "$f" "$dest"; f="$dest"
-        secs="$(sed -n 2p "$RUNDIR/replay.pid" 2>/dev/null || true)"
-    fi
-    copy_file "$f"
-    if [[ "$type" == replay ]]; then notify_saved "$f" "Clip saved (${secs:-$(replay_seconds)} s)"
-    else notify_saved "$f" "Recording saved"; fi
-}
-
-cmd_replay() {
-    local pid
-    if pid="$(live_pid "$RUNDIR/replay.pid")"; then run kill -USR1 "$pid"
-    elif dry; then echo "+ kill -USR1 <replay pid>"
-    else fail "replay buffer is not running (start Frame, or run: frame daemon)"; fi
-}
-
-# stop_recorder PID: INT, then TERM after STOP_WAIT s; fails if still alive.
-stop_recorder() {
-    local pid="$1" i
-    if dry; then echo "+ kill -INT $pid"; return 0; fi
-    kill -INT "$pid" 2>/dev/null || true
-    for ((i = 0; i < STOP_WAIT * 10; i++)); do gone "$pid" && return 0; sleep 0.1; done
-    warn "recorder did not stop after ${STOP_WAIT}s; sending TERM"
-    kill -TERM "$pid" 2>/dev/null || true
-    for ((i = 0; i < 20; i++)); do gone "$pid" && return 0; sleep 0.1; done
-    return 1
-}
-
-cmd_record() {
-    local pidf="$RUNDIR/record.pid" pid f kind cmd
-    ensure_rundir
-    exec 9>"$RUNDIR/record.lock"
-    flock -n 9 || die "frame record is already starting or stopping"
-    if pid="$(live_pid "$pidf")"; then
-        { read -r _; read -r f; read -r kind; } <"$pidf"
-        stop_recorder "$pid" || fail "recorder (pid $pid) is still running; kept $pidf"
-        rm -f "$pidf"
-        dry || [[ -s "$f" ]] || fail "recording failed, $f is empty (see $RUNDIR/record.log)"
-        [[ "$kind" == ffmpeg ]] && cmd_saved "$f" regular   # gsr calls the hook itself
-        echo "$f"; return
-    fi
-    mkdir -p "$(videos_dir)"
-    f="$(new_file "$(videos_dir)" record "${CFG[video_format]}")"
-    case "$(video_backend)" in
-        gpu-screen-recorder)
-            write_hook; kind=gsr
-            mapfile -t cmd < <(gsr_args); cmd=(gpu-screen-recorder "${cmd[@]}" -o "$f") ;;
-        ffmpeg) kind=ffmpeg; mapfile -t cmd < <(ffmpeg_args "$f") ;;
-        *) fail "recording needs gpu-screen-recorder (or ffmpeg on X11)" ;;
-    esac
-    if dry; then run "${cmd[@]}"; return; fi
-    "${cmd[@]}" </dev/null >>"$RUNDIR/record.log" 2>&1 9>&- &
-    pid=$!; disown
-    write_pid "$pidf" "$pid" "$f" "$kind"
-    sleep 1
-    live_pid "$pidf" >/dev/null || { rm -f "$pidf"; fail "recorder exited; see $RUNDIR/record.log"; }
-    notify "Recording started" "Press ${CFG[bind.record]:-frame record} again to stop" media-record
-    echo "recording to $f (run frame record again to stop)"
-}
-
-replay_cmd() {  # one argument per line
-    printf '%s\n' gpu-screen-recorder
-    gsr_args
-    printf '%s\n' -r "$(replay_seconds)" -replay-storage ram -o "$(videos_dir)"
-}
-
-# Foreground: apply shortcuts, keep the replay buffer alive, exit on TERM.
-cmd_daemon() {
-    local gpid="" spid="" stop=0 cmd secs
-    ensure_rundir
-    mkdir -p "$(videos_dir)" "$(images_dir)"
-    exec 8>"$RUNDIR/daemon.lock"
-    # Exit 3 = another daemon holds the lock: frame.service doesn't restart
-    # on it (RestartPreventExitStatus=3).
-    flock -n 8 || die "daemon already running (pid $(live_pid "$RUNDIR/daemon.pid" || echo '?'))" 3
-    # pid file and TERM trap first, so a stop during cmd_bind is not lost
-    # and the tray sees this daemon as soon as it holds the lock.
-    daemon_stop() {
-        stop=1
-        if [[ -n "$gpid" ]]; then kill -INT "$gpid" 2>/dev/null || true; fi
-        if [[ -n "$spid" ]]; then kill "$spid" 2>/dev/null || true; fi
-    }
-    if ! dry; then
-        write_pid "$RUNDIR/daemon.pid" $$
-        trap daemon_stop TERM INT
-    fi
-    cmd_bind || warn "could not apply shortcuts"
-    if yes_ "${CFG[replay]}" && [[ "$(video_backend)" != gpu-screen-recorder ]]; then
-        warn "replay buffer needs gpu-screen-recorder; replay disabled"; CFG[replay]=false
-    fi
-    mapfile -t cmd < <(replay_cmd)
-    secs="$(replay_seconds)"
-    if dry; then yes_ "${CFG[replay]}" && run "${cmd[@]}"; return 0; fi
-    write_hook
-    while ((!stop)); do
-        if yes_ "${CFG[replay]}"; then
-            "${cmd[@]}" </dev/null 8>&- &
-            gpid=$!; write_pid "$RUNDIR/replay.pid" "$gpid" "$secs"
-            echo "frame: replay buffer running (${secs}s, pid $gpid)"
-            wait "$gpid" || true
-            ((stop)) && break
-            rm -f "$RUNDIR/replay.pid"; gpid=""
-            warn "replay buffer exited; restarting in 5s"
-        fi
-        sleep 5 8>&- & spid=$!
-        wait "$spid" || true
-        spid=""
-    done
-    if [[ -n "$gpid" ]]; then wait "$gpid" 2>/dev/null || true; fi
-    rm -f "$RUNDIR/replay.pid" "$RUNDIR/daemon.pid"
-    echo "frame: daemon stopped"
-}
-
 # ------------------------------------------------------------------- binds
 
 # key_info KEY -> "QT_KEYCODE XKB_KEYSYM"; fails for keys we don't know.
@@ -840,18 +513,13 @@ state_save() {  # state_save BACKEND "action shortcut"...
 }
 
 # Quoting for the places that run our path: a desktop-entry Exec= argument
-# (\ " ` $ escaped in double quotes, then key-file \ doubling, % as %%),
-# the systemd ExecStart= program, and a GVariant string for gsettings.
+# (\ " ` $ escaped in double quotes, then key-file \ doubling, % as %%)
+# and a GVariant string for gsettings.
 desktop_arg() {
     local s="${1//\\/"\\\\"}"
     s="${s//\"/"\\\""}"; s="${s//\`/"\\\`"}"; s="${s//\$/"\\\$"}"
     s="\"$s\""; s="${s//\\/"\\\\"}"
     echo "${s//%/"%%"}"
-}
-systemd_arg() {  # for the program path only: systemd never expands $ there
-    local s="${1//\\/"\\\\"}"
-    s="${s//\"/"\\\""}"
-    echo "\"${s//%/"%%"}\""
 }
 gv_str() { local s="${1//\\/"\\\\"}"; echo "'${s//\'/"\\'"}'"; }
 
@@ -1021,16 +689,22 @@ unbind_saved() {  # unbind_saved BACKEND: remove what frame bound last time
     while read -r a key; do
         if [[ -n "$a" ]]; then "${be}_unbind" "$a" "$key"; fi
     done <<<"$saved"
-    if [[ "$be" == kde ]]; then  # .desktop shortcuts left without a state line
+    # .desktop shortcuts left without a state line. The old replay / record
+    # actions are dropped from KDE whether or not their .desktop entries
+    # are still there: installing 0.4 deletes those files before the tray
+    # gets to unbind them.
+    if [[ "$be" == kde ]]; then
         for a in "${ACTIONS[@]}"; do
             if ! grep -q "^$a " <<<"$saved" && [[ -e "$(kde_desktop "$a")" ]]; then kde_unbind "$a"; fi
+        done
+        for a in "${OLD_ACTIONS[@]}"; do
+            grep -q "^$a " <<<"$saved" || kde_unbind "$a" 2>/dev/null   # mostly long gone
         done
     fi
 }
 
-# One bind/unbind at a time: the daemon binds when it starts, and
-# frame-gui rebinds on Save. The lock fd is closed before returning, so a
-# daemon doesn't hold it (or hand it to gsr) for its whole life.
+# One bind/unbind at a time: the tray binds when it starts, and the
+# settings window rebinds on Save. The lock fd is closed before returning.
 with_bind_lock() {
     local fd rc=0
     ensure_rundir
@@ -1082,65 +756,25 @@ unbind_now() {
     state_save "$be"
 }
 
-# ----------------------------------------------------------------- service
+# ------------------------------------------------------------------ status
 
-unit_file() { echo "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/frame.service"; }
-
-cmd_service() {
-    local u pid; u="$(unit_file)"
-    case "${1:-}" in
-        on)
-            # The tray runs its own daemon; a service daemon would only lose
-            # the lock to it (or take it over after a tray restart).
-            if pid="$(live_pid "$RUNDIR/tray.pid")"; then
-                die "the Frame tray (frame-gui, pid $pid) already runs the daemon; quit it first, or keep using the tray"
-            fi
-            if dry; then echo "+ write $u (ExecStart=$(systemd_arg "$FRAME_BIN") daemon)"
-            else
-                mkdir -p "$(dirname "$u")"
-                cat >"$u" <<EOF
-[Unit]
-Description=frame screenshot shortcuts and replay buffer
-PartOf=graphical-session.target
-After=graphical-session.target
-
-[Service]
-ExecStart=$(systemd_arg "$FRAME_BIN") daemon
-Restart=on-failure
-RestartSec=5
-RestartPreventExitStatus=3
-
-[Install]
-WantedBy=graphical-session.target
-EOF
-            fi
-            # The daemon needs the session's display variables.
-            local v vars=()
-            for v in WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK; do
-                [[ -n "${!v:-}" ]] && vars+=("$v")
-            done
-            ((${#vars[@]})) && run systemctl --user import-environment "${vars[@]}"
-            run systemctl --user daemon-reload
-            run systemctl --user enable --now frame.service ;;
-        off)
-            run systemctl --user disable --now frame.service || true
-            run rm -f "$u"
-            run systemctl --user daemon-reload ;;
-        *) die "usage: frame service on|off" 2 ;;
-    esac
+# The PID in a pid file ("PID STARTTIME", written by frame-gui) if that same
+# process still runs; a stale file never matches a reused PID.
+live_pid() {
+    local pid start s f
+    [[ -f "$1" ]] && read -r pid start _ <"$1" || return 1
+    [[ "$pid" =~ ^[0-9]+$ && -n "$start" ]] || return 1
+    s="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+    s="${s##*") "}"; read -ra f <<<"$s"
+    [[ "${f[19]}" == "$start" ]] && echo "$pid"
 }
 
 cmd_status() {
-    local f pid
+    local pid
     echo "config: $CONFIG$([[ -f $CONFIG ]] || echo ' (defaults; run frame config)')"
     echo "images: $(images_dir)"
-    echo "videos: $(videos_dir)"
-    if pid="$(live_pid "$RUNDIR/daemon.pid")"; then echo "daemon: running (pid $pid)"; else echo "daemon: stopped"; fi
-    if live_pid "$RUNDIR/replay.pid" >/dev/null; then echo "replay: running, $(sed -n 2p "$RUNDIR/replay.pid")s buffer"; else echo "replay: off"; fi
-    if live_pid "$RUNDIR/record.pid" >/dev/null; then f="$(sed -n 2p "$RUNDIR/record.pid")"; echo "record: recording to $f"; else echo "record: idle"; fi
-    if have systemctl; then
-        echo "service: $(systemctl --user is-enabled frame.service 2>/dev/null || true)/$(systemctl --user is-active frame.service 2>/dev/null || true)"
-    fi
+    echo "shortcuts: $(state_get "$(bind_backend)" | awk -v keep=" ${ACTIONS[*]} " 'index(keep, " " $1 " ") { print $1 }' | paste -sd' ' -)"
+    if pid="$(live_pid "$RUNDIR/tray.pid")"; then echo "tray: running (pid $pid)"; else echo "tray: not running"; fi
 }
 
 # -------------------------------------------------------------------- main
@@ -1151,23 +785,17 @@ main() {
         -h|--help|help) usage; return 0 ;;
         -v|--version) echo "frame $VERSION"; return 0 ;;
         "") usage >&2; return 2 ;;
-        monitors) cmd_monitors; return ;;   # needs no config
     esac
     migrate_config
     load_config
     case "$cmd" in
         --detect) cmd_detect ;;
         region|window|monitor|all) cmd_shot "$cmd" ;;
-        replay) cmd_replay ;;
-        record) cmd_record ;;
-        daemon) cmd_daemon ;;
         bind) cmd_bind ;;
         unbind) cmd_unbind ;;
-        service) cmd_service "${2:-}" ;;
         status) cmd_status ;;
         config) cmd_config ;;
         check) echo ok ;;   # load_config above already validated it
-        _saved) cmd_saved "${2:?}" "${3:-regular}" ;;
         _toast) toast "${2:?}" "${3:?}" "${4:-0}" ;;
         *) echo "frame: unknown command: $cmd" >&2; usage >&2; return 2 ;;
     esac

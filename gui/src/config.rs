@@ -7,32 +7,15 @@ use std::collections::BTreeMap;
 pub const DEFAULTS: &[(&str, &str)] = &[
     ("save_dir", "~/Documents"),
     ("image_format", "png"),
-    ("video_format", "mp4"),
     ("clipboard", "true"),
     ("notify", "true"),
-    ("replay", "true"),
-    ("replay_seconds", "auto"),
-    ("video_source", "auto"),
-    ("video_fps", "60"),
-    ("video_quality", "very_high"),
-    ("video_codec", "auto"),
-    ("audio", "default_output"),
     ("bind.region", "Meta+Alt+R"),
     ("bind.window", "Meta+Alt+W"),
     ("bind.monitor", "Meta+Alt+M"),
     ("bind.all", "Meta+Alt+A"),
-    ("bind.replay", "Meta+Alt+C"),
-    ("bind.record", "Meta+Alt+V"),
 ];
 
-pub const ACTIONS: &[&str] = &["region", "window", "monitor", "all", "replay", "record"];
-
-/// Keys `frame daemon` reads only when it starts (replay buffer, file
-/// names): a change means the tray restarts it.
-pub const DAEMON_KEYS: &[&str] = &[
-    "save_dir", "video_format", "replay", "replay_seconds", "video_source", "video_fps",
-    "video_quality", "video_codec", "audio",
-];
+pub const ACTIONS: &[&str] = &["region", "window", "monitor", "all"];
 
 pub fn is_known(key: &str) -> bool {
     DEFAULTS.iter().any(|(k, _)| *k == key)
@@ -100,7 +83,8 @@ fn lines(text: &[u8]) -> Vec<&[u8]> {
 }
 
 /// Effective settings: defaults, then every known key in the file (last
-/// wins). A value that isn't UTF-8 is shown lossily; it is only written
+/// wins). Other keys (like the video settings of Frame < 0.4) are
+/// skipped. A value that isn't UTF-8 is shown lossily; it is only written
 /// back if the user edits it.
 pub fn parse(text: impl AsRef<[u8]>) -> BTreeMap<String, String> {
     let mut m: BTreeMap<String, String> =
@@ -241,24 +225,13 @@ fn known_key(k: &str) -> bool {
 }
 
 /// Would `validate_config` in bin/frame accept V for KEY on its own?
-/// (Free-text keys and the webm/codec pair aren't checked here.)
+/// (save_dir and shortcuts aren't checked here.)
 pub fn valid_value(key: &str, v: &str) -> bool {
-    let int_in = |lo: u64, hi: u64| {
-        !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) && v.parse::<u64>().is_ok_and(|n| (lo..=hi).contains(&n))
-    };
     match key {
         "image_format" => matches!(v, "png" | "jpg" | "webp"),
-        "video_format" => matches!(v, "mp4" | "webm" | "mkv"),
-        "clipboard" | "notify" | "replay" => {
+        "clipboard" | "notify" => {
             matches!(v.to_ascii_lowercase().as_str(), "true" | "false" | "yes" | "no" | "on" | "off" | "1" | "0")
         }
-        "replay_seconds" => v == "auto" || int_in(5, 1800),
-        "video_fps" => int_in(1, 240),
-        "video_quality" => matches!(v, "medium" | "high" | "very_high" | "ultra"),
-        "video_codec" => matches!(
-            v,
-            "auto" | "h264" | "hevc" | "av1" | "vp8" | "vp9" | "hevc_hdr" | "av1_hdr" | "hevc_10bit" | "av1_10bit"
-        ),
         _ => true,
     }
 }
@@ -283,36 +256,51 @@ mod tests {
 
     #[test]
     fn parse_like_bash() {
-        let t = "# c\n  # indented\nsave_dir = \"/x/my#docs\"   # real\nvideo_source = 'DP-1'#x\n\
-                 image_format=jpg#no-space\nvideo_codec = 'av1'\nfoo.bar = 1\njunk line\n\
-                 audio =   none  \t\nbind.window =\nvideo_fps = 30";
+        let t = "# c\n  # indented\nsave_dir = \"/x/my#docs\"   # real\nbind.region = 'Meta+R'#x\n\
+                 image_format=jpg#no-space\nbind.all = 'Alt+A'\nfoo.bar = 1\njunk line\n\
+                 clipboard =   false  \t\nbind.window =\nbind.monitor = F9";
         let m = parse(t);
         assert_eq!(m["save_dir"], "/x/my#docs");
-        assert_eq!(m["video_source"], "'DP-1'#x");
+        assert_eq!(m["bind.region"], "'Meta+R'#x");
         assert_eq!(m["image_format"], "jpg#no-space");
-        assert_eq!(m["video_codec"], "av1");
-        assert_eq!(m["audio"], "none");
+        assert_eq!(m["bind.all"], "Alt+A");
+        assert_eq!(m["clipboard"], "false");
         assert_eq!(m["bind.window"], "");
-        assert_eq!(m["video_fps"], "30"); // last line without \n
+        assert_eq!(m["bind.monitor"], "F9"); // last line without \n
         assert_eq!(m["notify"], "true"); // default
         assert!(!m.contains_key("foo.bar"));
     }
 
+    /// Video settings from Frame < 0.4 are skipped, like unknown keys, and
+    /// a write keeps their lines as they are.
+    #[test]
+    fn old_video_keys_ignored() {
+        let t = "replay = true\nvideo_fps = 60\naudio = default_output\nbind.replay = Meta+Alt+C\n\
+                 bind.record = Meta+Alt+V\nimage_format = png\n";
+        let m = parse(t);
+        for k in ["replay", "video_fps", "audio", "bind.replay", "bind.record"] {
+            assert!(!m.contains_key(k), "{k}");
+        }
+        assert_eq!(m.len(), DEFAULTS.len());
+        let out = ap(t, &[("image_format", "jpg")]);
+        assert_eq!(out, t.replace("image_format = png", "image_format = jpg"));
+    }
+
     #[test]
     fn quote_pair_only_one() {
-        assert_eq!(parse("audio = \"\"x\"\"\n")["audio"], "\"x\"");
-        assert_eq!(parse("audio = \"x'\n")["audio"], "\"x'");
-        assert_eq!(parse("audio = \"\n")["audio"], "\"");
+        assert_eq!(parse("save_dir = \"\"x\"\"\n")["save_dir"], "\"x\"");
+        assert_eq!(parse("save_dir = \"x'\n")["save_dir"], "\"x'");
+        assert_eq!(parse("save_dir = \"\n")["save_dir"], "\"");
     }
 
     /// Only ASCII whitespace counts (bash runs load_config under LC_ALL=C):
     /// U+3000 before # is part of the value, and no edge trimming of it.
     #[test]
     fn unicode_space_is_not_space() {
-        assert_eq!(parse("audio = x\u{3000}#c\n")["audio"], "x\u{3000}#c");
-        assert_eq!(parse("audio =\u{3000}x\u{3000}\n")["audio"], "\u{3000}x\u{3000}");
+        assert_eq!(parse("save_dir = x\u{3000}#c\n")["save_dir"], "x\u{3000}#c");
+        assert_eq!(parse("save_dir =\u{3000}x\u{3000}\n")["save_dir"], "\u{3000}x\u{3000}");
         assert!(unrepresentable("a\u{3000}#b").is_none());
-        assert_eq!(ap("audio = y\n", &[("audio", "a\u{3000}#b")]), "audio = a\u{3000}#b\n");
+        assert_eq!(ap("save_dir = y\n", &[("save_dir", "a\u{3000}#b")]), "save_dir = a\u{3000}#b\n");
     }
 
     #[test]
@@ -332,22 +320,22 @@ mod tests {
 
     #[test]
     fn write_long_value_keeps_one_space_before_comment() {
-        let out = ap("audio = none # c\n", &[("audio", "alsa_output.pci-0000_00_1f.3")]);
-        assert_eq!(out, "audio = alsa_output.pci-0000_00_1f.3 # c\n");
+        let out = ap("save_dir = ~ # c\n", &[("save_dir", "/media/kevin/Pictures/Screens")]);
+        assert_eq!(out, "save_dir = /media/kevin/Pictures/Screens # c\n");
     }
 
     #[test]
     fn write_appends_missing_keys_in_default_order() {
-        let out = ap("save_dir = /x", &[("bind.record", ""), ("video_fps", "30")]);
-        assert_eq!(out, "save_dir = /x\nvideo_fps = 30\nbind.record =\n");
+        let out = ap("save_dir = /x", &[("bind.all", ""), ("notify", "false")]);
+        assert_eq!(out, "save_dir = /x\nnotify = false\nbind.all =\n");
         let m = parse(&out);
-        assert_eq!(m["bind.record"], "");
-        assert_eq!(m["video_fps"], "30");
+        assert_eq!(m["bind.all"], "");
+        assert_eq!(m["notify"], "false");
     }
 
     #[test]
     fn write_every_duplicate_and_no_space_after_eq() {
-        assert_eq!(ap("audio=a\naudio = b\n", &[("audio", "none")]), "audio= none\naudio = none\n");
+        assert_eq!(ap("save_dir=a\nsave_dir = b\n", &[("save_dir", "/c")]), "save_dir= /c\nsave_dir = /c\n");
     }
 
     #[test]
@@ -358,31 +346,31 @@ mod tests {
 
     #[test]
     fn edited_crlf_lines_keep_cr() {
-        let t = "audio = x\r\nvideo_fps = 30  # c\r\nbind.all = Meta+A\r\nnotify = true\n";
-        let out = ap(t, &[("audio", "none"), ("video_fps", "45"), ("bind.all", ""), ("notify", "false")]);
-        assert_eq!(out, "audio = none\r\nvideo_fps = 45  # c\r\nbind.all =\r\nnotify = false\n");
+        let t = "save_dir = /x\r\nimage_format = png  # c\r\nbind.all = Meta+A\r\nnotify = true\n";
+        let out = ap(t, &[("save_dir", "/y"), ("image_format", "jpg"), ("bind.all", ""), ("notify", "false")]);
+        assert_eq!(out, "save_dir = /y\r\nimage_format = jpg  # c\r\nbind.all =\r\nnotify = false\n");
         let m = parse(&out);
-        assert_eq!((m["audio"].as_str(), m["video_fps"].as_str(), m["bind.all"].as_str()), ("none", "45", ""));
+        assert_eq!((m["save_dir"].as_str(), m["image_format"].as_str(), m["bind.all"].as_str()), ("/y", "jpg", ""));
     }
 
     /// Bytes that aren't UTF-8 (a Latin-1 comment, an unknown key's value)
     /// come back exactly; only the edited line changes.
     #[test]
     fn non_utf8_bytes_round_trip() {
-        let t: &[u8] = b"# caf\xe9 \xff\nfoo.bar = \xfe\xfd\nvideo_fps = 30 # \xe9t\xe9\naudio = a\xe9b\n";
+        let t: &[u8] = b"# caf\xe9 \xff\nfoo.bar = \xfe\xfd\nimage_format = png # \xe9t\xe9\nsave_dir = /a\xe9b\n";
         assert_eq!(apply(t, &BTreeMap::new()).unwrap(), t);
         let m = parse(t);
-        assert_eq!(m["video_fps"], "30");
-        assert_eq!(m["audio"], "a\u{fffd}b");
-        let out = apply(t, &ch(&[("video_fps", "45")])).unwrap();
-        assert_eq!(out, b"# caf\xe9 \xff\nfoo.bar = \xfe\xfd\nvideo_fps = 45 # \xe9t\xe9\naudio = a\xe9b\n");
+        assert_eq!(m["image_format"], "png");
+        assert_eq!(m["save_dir"], "/a\u{fffd}b");
+        let out = apply(t, &ch(&[("image_format", "jpg")])).unwrap();
+        assert_eq!(out, b"# caf\xe9 \xff\nfoo.bar = \xfe\xfd\nimage_format = jpg # \xe9t\xe9\nsave_dir = /a\xe9b\n");
     }
 
     #[test]
     fn tricky_values_round_trip() {
         for v in ["/my dir/a#b", " lead", "trail ", "\"q\"", "'q'", "#hash", "a\"b", "", "Дé x", "\"x"] {
-            let out = ap("audio = x # c\n", &[("audio", v)]);
-            assert_eq!(parse(&out)["audio"], v, "value {v:?} -> {out:?}");
+            let out = ap("save_dir = x # c\n", &[("save_dir", v)]);
+            assert_eq!(parse(&out)["save_dir"], v, "value {v:?} -> {out:?}");
         }
     }
 
@@ -390,7 +378,7 @@ mod tests {
     fn refuses_unrepresentable() {
         for v in ["a #b", "a\t#b", "line\nbreak", "tab\there"] {
             assert!(unrepresentable(v).is_some(), "{v:?}");
-            assert!(apply(b"", &ch(&[("audio", v)])).is_err(), "{v:?}");
+            assert!(apply(b"", &ch(&[("save_dir", v)])).is_err(), "{v:?}");
         }
         assert!(unrepresentable("a#b").is_none());
         assert!(unrepresentable("/my dir/x").is_none());
@@ -412,19 +400,17 @@ mod tests {
         for (k, v) in DEFAULTS {
             assert!(valid_value(k, v), "default {k}={v}");
         }
-        for (k, v) in [("video_fps", "fast"), ("video_fps", "0"), ("video_fps", "241"), ("video_fps", "+5"), ("video_fps", ""),
-                       ("replay_seconds", "4"), ("replay_seconds", "Auto"), ("notify", "maybe"), ("image_format", "PNG"),
-                       ("video_codec", "x264"), ("video_quality", "low")] {
+        for (k, v) in [("notify", "maybe"), ("clipboard", ""), ("image_format", "PNG"), ("image_format", "gif")] {
             assert!(!valid_value(k, v), "{k}={v}");
         }
-        for (k, v) in [("video_fps", "060"), ("notify", "OFF"), ("replay_seconds", "1800"), ("audio", "anything")] {
+        for (k, v) in [("notify", "OFF"), ("clipboard", "0"), ("save_dir", "anything")] {
             assert!(valid_value(k, v), "{k}={v}");
         }
     }
 
     /// The bash parser itself agrees with the writer (skipped without bash).
     /// Run under a UTF-8 locale: load_config must still treat only ASCII
-    /// as space.
+    /// as space. save_dir is free text; validation is off for the odd values.
     #[test]
     fn bash_reads_what_we_write() {
         let frame = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../bin/frame");
@@ -437,7 +423,7 @@ mod tests {
             std::fs::write(&cfg, text).unwrap();
             let out = std::process::Command::new("bash")
                 .arg("-c")
-                .arg(r#"source "$1"; load_config 2>/dev/null; printf %s "${CFG[audio]}""#)
+                .arg(r#"source "$1"; validate_config() { :; }; load_config 2>/dev/null; printf %s "${CFG[save_dir]}""#)
                 .arg("_")
                 .arg(&frame)
                 .env("FRAME_CONFIG", &cfg)
@@ -449,11 +435,11 @@ mod tests {
             out.stdout
         };
         for v in ["/my dir/a#b", " lead", "trail ", "\"q\"", "'q'", "#hash", "a\"b", "", "Дé x", "\"x", "a'b c", "a\u{3000}#b", "\u{3000}x"] {
-            let text = apply(b"audio = x   # c\nfoo.bar = 1\n", &ch(&[("audio", v)])).unwrap();
+            let text = apply(b"save_dir = x   # c\nfoo.bar = 1\n", &ch(&[("save_dir", v)])).unwrap();
             assert_eq!(String::from_utf8_lossy(&read_back(&text)), v, "bash read back {v:?}");
         }
-        for line in ["audio = x\u{3000}#c\n", "audio =\u{3000}x\u{3000}\n", "audio = 'a b' # c\r\n"] {
-            assert_eq!(String::from_utf8_lossy(&read_back(line.as_bytes())), parse(line)["audio"], "{line:?}");
+        for line in ["save_dir = x\u{3000}#c\n", "save_dir =\u{3000}x\u{3000}\n", "save_dir = 'a b' # c\r\n"] {
+            assert_eq!(String::from_utf8_lossy(&read_back(line.as_bytes())), parse(line)["save_dir"], "{line:?}");
         }
     }
 }

@@ -1,4 +1,4 @@
-//! Paths shared with bin/frame and the live state read from its pid files.
+//! Paths shared with bin/frame, and the tray's pid file.
 
 use std::path::{Path, PathBuf};
 
@@ -63,19 +63,20 @@ pub fn autostart_file() -> PathBuf {
     config_home().join("autostart/frame-gui.desktop")
 }
 
-/// RUNDIR/tray.pid: "PID STARTTIME" of the running tray (it owns the daemon).
+/// RUNDIR/tray.pid: "PID STARTTIME" of the running tray.
 pub fn tray_pid_file(rundir: &Path) -> PathBuf {
     rundir.join("tray.pid")
 }
 
-/// Write FILE as bin/frame's write_pid does, for our own process.
+/// Write FILE as "PID STARTTIME" for our own process (bin/frame's
+/// live_pid reads it for `frame status`).
 pub fn write_own_pid(file: &Path) -> std::io::Result<()> {
     let pid = std::process::id();
     let start = proc_start(Path::new("/proc"), pid).unwrap_or_default();
     std::fs::write(file, format!("{pid} {start}\n"))
 }
 
-/// Is the tray running (so it applies daemon settings itself)?
+/// Is the tray running?
 pub fn tray_running(proc_root: &Path, rundir: &Path) -> bool {
     live_pid(proc_root, &tray_pid_file(rundir)).is_some()
 }
@@ -99,18 +100,11 @@ pub fn proc_start(proc_root: &Path, pid: u32) -> Option<String> {
     rest.split_whitespace().nth(19).map(str::to_string)
 }
 
-/// A pid file: "PID STARTTIME" then extra lines (output file, seconds…).
-#[derive(Debug, Clone, PartialEq)]
-pub struct PidFile {
-    pub pid: u32,
-    pub extra: Vec<String>,
-}
-
-/// The pid file's process, if that same process still runs (live_pid).
-pub fn live_pid(proc_root: &Path, file: &Path) -> Option<PidFile> {
+/// The PID in a pid file ("PID STARTTIME"), if that same process still
+/// runs (like live_pid in bin/frame).
+pub fn live_pid(proc_root: &Path, file: &Path) -> Option<u32> {
     let text = std::fs::read_to_string(file).ok()?;
-    let mut lines = text.lines();
-    let mut first = lines.next()?.split_whitespace();
+    let mut first = text.lines().next()?.split_whitespace();
     let pid_s = first.next()?;
     let start = first.next()?;
     if !pid_s.bytes().all(|b| b.is_ascii_digit()) {
@@ -120,42 +114,7 @@ pub fn live_pid(proc_root: &Path, file: &Path) -> Option<PidFile> {
     if proc_start(proc_root, pid)? != start {
         return None;
     }
-    Some(PidFile { pid, extra: lines.map(str::to_string).collect() })
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Status {
-    /// Output file of a running `frame record`.
-    pub recording: Option<String>,
-    /// Replay buffer length in seconds, when the buffer runs.
-    pub replay: Option<String>,
-    pub daemon: bool,
-}
-
-impl Status {
-    pub fn read(proc_root: &Path, rundir: &Path) -> Status {
-        let rec = live_pid(proc_root, &rundir.join("record.pid"));
-        let daemon = live_pid(proc_root, &rundir.join("daemon.pid")).is_some();
-        let replay = if daemon { live_pid(proc_root, &rundir.join("replay.pid")) } else { None };
-        Status {
-            recording: rec.map(|p| p.extra.first().cloned().unwrap_or_default()),
-            replay: replay.map(|p| p.extra.first().cloned().unwrap_or_default()),
-            daemon,
-        }
-    }
-
-    pub fn tooltip(&self) -> String {
-        if let Some(f) = &self.recording {
-            let name = Path::new(f).file_name().map(|n| n.to_string_lossy().into_owned());
-            return format!("Frame: recording to {}", name.unwrap_or_else(|| f.clone()));
-        }
-        match (&self.replay, self.daemon) {
-            (Some(s), _) if !s.is_empty() => format!("Frame: replay buffer {s} s"),
-            (Some(_), _) => "Frame: replay buffer on".into(),
-            (None, true) => "Frame: running, replay buffer off".into(),
-            (None, false) => "Frame: not running".into(),
-        }
-    }
+    Some(pid)
 }
 
 #[cfg(test)]
@@ -181,37 +140,23 @@ mod tests {
     }
 
     #[test]
-    fn pid_files_and_status() {
+    fn pid_files() {
         let t = tempdir("pids");
         let (p, run) = (t.join("proc"), t.join("run"));
         std::fs::create_dir_all(&run).unwrap();
-        fake_proc(&p, 100, "gpu-screen-recorder", "500");
-        fake_proc(&p, 200, "bash", "600");
-        fake_proc(&p, 201, "gpu screen) rec", "601");
-
-        assert_eq!(Status::read(&p, &run).tooltip(), "Frame: not running");
-
-        std::fs::write(run.join("daemon.pid"), "200 600\n").unwrap();
-        std::fs::write(run.join("replay.pid"), "201 601\n60\n").unwrap();
-        let s = Status::read(&p, &run);
-        assert_eq!(s, Status { recording: None, replay: Some("60".into()), daemon: true });
-        assert_eq!(s.tooltip(), "Frame: replay buffer 60 s");
+        fake_proc(&p, 200, "frame-gui", "600");
+        assert!(!tray_running(&p, &run));
+        std::fs::write(tray_pid_file(&run), "200 600\n").unwrap();
+        assert!(tray_running(&p, &run));
+        assert_eq!(live_pid(&p, &tray_pid_file(&run)), Some(200));
 
         // Stale: same pid, other start time -> not live.
-        std::fs::write(run.join("record.pid"), "100 499\n/v/a.mp4\ngsr\n").unwrap();
-        assert_eq!(Status::read(&p, &run).recording, None);
-        std::fs::write(run.join("record.pid"), "100 500\n/v/2026_record.mp4\ngsr\n").unwrap();
-        let s = Status::read(&p, &run);
-        assert_eq!(s.recording.as_deref(), Some("/v/2026_record.mp4"));
-        assert_eq!(s.tooltip(), "Frame: recording to 2026_record.mp4");
+        std::fs::write(tray_pid_file(&run), "200 599\n").unwrap();
+        assert!(!tray_running(&p, &run));
 
-        // Replay without a live daemon doesn't count.
-        std::fs::remove_file(run.join("daemon.pid")).unwrap();
-        assert_eq!(Status::read(&p, &run).replay, None);
-
-        for bad in ["", "abc 500\n", "100\n", "-100 500\n", "100 500x\n"] {
-            std::fs::write(run.join("record.pid"), bad).unwrap();
-            assert_eq!(live_pid(&p, &run.join("record.pid")), None, "{bad:?}");
+        for bad in ["", "abc 600\n", "200\n", "-200 600\n", "200 600x\n"] {
+            std::fs::write(tray_pid_file(&run), bad).unwrap();
+            assert_eq!(live_pid(&p, &tray_pid_file(&run)), None, "{bad:?}");
         }
     }
 }

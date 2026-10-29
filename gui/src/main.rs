@@ -9,7 +9,6 @@
 //!   frame-gui --grab MODE [X Y W H] OUT.png   KDE screenshot (used by frame)
 
 mod config;
-mod daemon;
 mod grab;
 mod icons;
 mod settings;
@@ -46,7 +45,7 @@ fn main() {
 
 /// Hold an exclusive flock on RUNDIR/NAME for the life of the process,
 /// or None if another process has it. Rust opens files close-on-exec, so
-/// the lock never leaks into frame or the recorder.
+/// the lock never leaks into frame.
 fn take_lock(name: &str) -> Result<Option<File>, String> {
     let dir = state::ensure_rundir()?;
     let f = File::create(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
@@ -144,7 +143,7 @@ fn is_exec(p: &Path) -> bool {
     p.metadata().map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
 }
 
-/// `frame ARGS…` detached (screenshots, record, replay, service).
+/// `frame ARGS…` detached (screenshots, bind).
 pub fn clip_detached(args: &[&str]) {
     spawn_detached(Command::new(clip_bin()).args(args));
 }

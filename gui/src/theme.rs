@@ -3,8 +3,9 @@
 //! listed in design/gui.md; keep the two in step.
 
 use eframe::egui::{
-    self, Color32, CornerRadius, FontFamily, FontId, Margin, Response, RichText, Sense, Shadow,
-    Stroke, StrokeKind, TextStyle, Ui, Vec2, WidgetInfo, WidgetType,
+    self, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Layout, Margin, Pos2, Rect,
+    Response, RichText, Sense, Shadow, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, Vec2,
+    WidgetInfo, WidgetType,
 };
 
 // Surfaces, darkest to lightest.
@@ -33,8 +34,6 @@ pub const AMBER: Color32 = Color32::from_rgb(0xf5, 0xb5, 0x44);
 
 pub const RADIUS: u8 = 8; // controls
 pub const CARD_RADIUS: u8 = 12;
-/// Width of the label column inside cards, so every control lines up.
-pub const LABEL_WIDTH: f32 = 132.0;
 
 /// Install the theme. Call once, before the first frame.
 pub fn apply(ctx: &egui::Context) {
@@ -140,31 +139,7 @@ fn style(s: &mut egui::Style) {
     w.open.corner_radius = r;
 }
 
-/// A rounded section card with a small caps title. Contents get the full
-/// card width; use `row` inside for label + control lines.
-pub fn card<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
-    egui::Frame::new()
-        .fill(CARD)
-        .stroke(line(1.0, BORDER))
-        .corner_radius(CORNER_CARD)
-        .inner_margin(Margin {
-            left: 16,
-            right: 16,
-            top: 12,
-            bottom: 14,
-        })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            section_header(ui, title);
-            ui.add_space(2.0);
-            add_contents(ui)
-        })
-        .inner
-}
-
-const CORNER_CARD: CornerRadius = CornerRadius::same(CARD_RADIUS);
-
-/// Card / group title: small, bold-ish, muted, letter-spaced feel via caps.
+/// Small caps sub-heading (inside the shortcut editor).
 pub fn section_header(ui: &mut Ui, title: &str) {
     ui.label(
         RichText::new(title.to_uppercase())
@@ -172,23 +147,6 @@ pub fn section_header(ui: &mut Ui, title: &str) {
             .strong()
             .color(TEXT_MUTED),
     );
-}
-
-/// One settings line: fixed-width label on the left, control(s) after it.
-pub fn row<R>(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
-    ltr(ui, |ui| {
-        let h = ui.spacing().interact_size.y;
-        ui.allocate_ui_with_layout(
-            Vec2::new(LABEL_WIDTH, h),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.set_min_width(LABEL_WIDTH);
-                ui.label(RichText::new(label).color(TEXT));
-            },
-        );
-        add_contents(ui)
-    })
-    .inner
 }
 
 /// Small grey explanatory text.
@@ -260,21 +218,7 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
     resp
 }
 
-/// `toggle` followed by a clickable label, like a checkbox.
-pub fn toggle_label(ui: &mut Ui, on: &mut bool, text: &str) -> Response {
-    ltr(ui, |ui| {
-        let mut r = toggle(ui, on);
-        let l = ui.add(egui::Label::new(RichText::new(text).color(TEXT)).sense(Sense::click()));
-        if l.clicked() {
-            *on = !*on;
-            r.mark_changed();
-        }
-        r | l
-    })
-    .inner
-}
-
-/// Coloured dot + text, for the header status ("Replay on · 60 s").
+/// Coloured dot + text, for the header status ("Running").
 pub fn status_pill(ui: &mut Ui, color: Color32, text: &str) -> Response {
     // Painted by hand so it sizes to its text in any parent layout.
     let galley = ui
@@ -300,40 +244,11 @@ pub fn status_pill(ui: &mut Ui, color: Color32, text: &str) -> Response {
     resp
 }
 
-/// A shortcut shown as keycaps ("Meta+Alt+R" → [Meta] [Alt] [R]); an empty
-/// string shows a faint "Not set". Fixed width so Record/Clear line up.
-pub fn keycaps(ui: &mut Ui, combo: &str, width: f32) -> Response {
-    let h = ui.spacing().interact_size.y;
-    ui.allocate_ui_with_layout(
-        Vec2::new(width, h),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.set_min_width(width);
-            ui.spacing_mut().item_spacing.x = 4.0;
-            if combo.trim().is_empty() {
-                ui.label(RichText::new("Not set").italics().color(TEXT_FAINT));
-                return;
-            }
-            for key in combo.split('+').filter(|k| !k.is_empty()) {
-                egui::Frame::new()
-                    .fill(CONTROL)
-                    .stroke(line(1.0, BORDER_STRONG))
-                    .corner_radius(CornerRadius::same(5))
-                    .inner_margin(Margin::symmetric(7, 2))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(key).size(12.5).color(TEXT));
-                    });
-            }
-        },
-    )
-    .response
-}
-
-/// Frame for the sticky bottom bar (Unsaved changes · Revert · Save).
+/// Frame for the sticky bottom bar (Unsaved changes · Revert · Save). No
+/// box stroke: call `top_hairline` inside it for the one line on top.
 pub fn bottom_bar_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(CARD)
-        .stroke(line(1.0, BORDER))
         .inner_margin(Margin {
             left: 16,
             right: 16,
@@ -342,25 +257,299 @@ pub fn bottom_bar_frame() -> egui::Frame {
         })
 }
 
+/// The 1 px BORDER line along the top edge of `bottom_bar_frame`.
+pub fn top_hairline(ui: &mut Ui) {
+    let r = ui.max_rect().expand2(Vec2::new(16.0, 10.0));
+    ui.painter().hline(r.x_range(), r.top() + 0.5, line(1.0, BORDER));
+}
+
 /// Frame for the central scroll area (page margins around the cards).
 pub fn page_frame() -> egui::Frame {
     egui::Frame::new().fill(BG).inner_margin(Margin {
         left: 16,
         right: 16,
-        top: 12,
+        top: 8,
         bottom: 12,
     })
 }
 
-/// Like `ui.horizontal`, but always left to right (also inside a
-/// right-to-left parent, e.g. a right-aligned header or bottom bar).
-fn ltr<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
-    let size = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
-    ui.allocate_ui_with_layout(
-        size,
-        egui::Layout::left_to_right(egui::Align::Center),
-        add_contents,
+/// Height of a one-line list row and of a row with a subtitle.
+pub const ROW_H: f32 = 44.0;
+pub const ROW_H_TALL: f32 = 54.0;
+/// Left/right padding inside list rows.
+pub const ROW_PAD_X: f32 = 14.0;
+/// Icon tile on shortcut rows.
+const TILE: f32 = 28.0;
+
+/// Which glyph a shortcut row shows.
+#[derive(Clone, Copy)]
+pub enum Glyph {
+    Region,
+    Window,
+    Monitor,
+    AllMonitors,
+}
+
+/// Group title above a list card ("Shortcuts").
+pub fn group_title(ui: &mut Ui, text: &str) {
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        ui.label(RichText::new(text).size(13.0).strong().color(TEXT_MUTED));
+    });
+    ui.add_space(-2.0);
+}
+
+/// A card holding list rows edge to edge (no title inside, no padding;
+/// rows bring their own). Rows are separated by hairlines, not gaps.
+pub fn list_card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(CARD)
+        .stroke(Stroke::new(1.0_f32, BORDER))
+        .corner_radius(CornerRadius::same(CARD_RADIUS))
+        .inner_margin(Margin::same(0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            add_contents(ui)
+        })
+        .inner
+}
+
+/// One list row: optional icon tile, title (+ faint subtitle) on the left,
+/// `right` laid out right to left on the right. `divider` draws the
+/// hairline above it (false for the first row). A `clickable` row
+/// highlights on hover, shows a chevron and its response `clicked()`.
+pub fn list_row<R>(
+    ui: &mut Ui,
+    divider: bool,
+    glyph: Option<Glyph>,
+    title: &str,
+    subtitle: Option<&str>,
+    clickable: bool,
+    right: impl FnOnce(&mut Ui) -> R,
+) -> (Response, R) {
+    let h = if subtitle.is_some() { ROW_H_TALL } else { ROW_H };
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::hover());
+    let sense = if clickable { Sense::click() } else { Sense::hover() };
+    let resp = ui.interact(rect, ui.id().with(("list_row", title)), sense);
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, title));
+
+    let p = ui.painter().clone();
+    if clickable && (resp.hovered() || resp.has_focus()) {
+        p.rect_filled(rect.shrink(4.0), CornerRadius::same(RADIUS), CONTROL.gamma_multiply(0.7));
+    }
+    if resp.has_focus() {
+        p.rect_stroke(rect.shrink(4.0), CornerRadius::same(RADIUS), Stroke::new(1.5_f32, ACCENT_HOVER), StrokeKind::Inside);
+    }
+    let mut x = rect.left() + ROW_PAD_X;
+    if divider {
+        let dx = if glyph.is_some() { x + TILE + 12.0 } else { x };
+        p.hline(dx..=rect.right(), rect.top(), Stroke::new(1.0_f32, BORDER));
+    }
+    if let Some(g) = glyph {
+        let tile = Rect::from_center_size(Pos2::new(x + TILE / 2.0, rect.center().y), Vec2::splat(TILE));
+        p.rect_filled(tile, CornerRadius::same(7), ACCENT.gamma_multiply(0.16));
+        paint_glyph(&p, tile.shrink(6.0), g, ACCENT_HOVER);
+        x += TILE + 12.0;
+    }
+    let mut right_rect = rect.shrink2(Vec2::new(ROW_PAD_X, 0.0));
+    if clickable {
+        let c = Pos2::new(right_rect.right() - 3.0, rect.center().y);
+        let s = Stroke::new(1.6_f32, if resp.hovered() { TEXT_MUTED } else { TEXT_FAINT });
+        p.line_segment([c + Vec2::new(-3.0, -5.0), c], s);
+        p.line_segment([c + Vec2::new(-3.0, 5.0), c], s);
+        right_rect.max.x -= 18.0;
+    }
+    let right = ui.scope_builder(
+        UiBuilder::new().max_rect(right_rect).layout(Layout::right_to_left(Align::Center)),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            right(ui)
+        },
+    );
+    // Text gets what the right side left over, cut with "…" if longer.
+    let used = right.response.rect;
+    let text_w = if used.width() > 0.0 { used.left() - 12.0 - x } else { right_rect.right() - x };
+    let line = |text: &str, size: f32, color: Color32| {
+        let mut job = egui::text::LayoutJob::single_section(
+            text.to_owned(),
+            egui::TextFormat::simple(FontId::proportional(size), color),
+        );
+        job.wrap = egui::text::TextWrapping::truncate_at_width(text_w.max(24.0));
+        p.layout_job(job)
+    };
+    match subtitle {
+        None => {
+            let g = line(title, 14.0, TEXT);
+            p.galley(Pos2::new(x, rect.center().y - g.size().y / 2.0), g, TEXT);
+        }
+        Some(sub) => {
+            let g = line(title, 14.0, TEXT);
+            p.galley(Pos2::new(x, rect.center().y - 1.0 - g.size().y), g, TEXT);
+            let g = line(sub, 12.0, TEXT_FAINT);
+            p.galley(Pos2::new(x, rect.center().y + 2.0), g, TEXT_FAINT);
+        }
+    }
+    (resp, right.inner)
+}
+
+/// 16 px line icons for the four capture actions, painted (no font glyphs).
+pub fn paint_glyph(p: &egui::Painter, r: Rect, g: Glyph, color: Color32) {
+    let s = Stroke::new(1.6_f32, color);
+    let (l, t, rt, b) = (r.left(), r.top(), r.right(), r.bottom());
+    match g {
+        Glyph::Region => {
+            let k = 4.5;
+            for (c, dx, dy) in [
+                (Pos2::new(l, t), 1.0, 1.0),
+                (Pos2::new(rt, t), -1.0, 1.0),
+                (Pos2::new(rt, b), -1.0, -1.0),
+                (Pos2::new(l, b), 1.0, -1.0),
+            ] {
+                p.line_segment([c, c + Vec2::new(k * dx, 0.0)], s);
+                p.line_segment([c, c + Vec2::new(0.0, k * dy)], s);
+            }
+            p.circle_filled(r.center(), 2.0, color);
+        }
+        Glyph::Window => {
+            let w = Rect::from_min_max(Pos2::new(l, t + 1.5), Pos2::new(rt, b - 1.5));
+            p.rect_stroke(w, CornerRadius::same(2), s, StrokeKind::Middle);
+            p.hline(l..=rt, t + 5.0, s);
+        }
+        Glyph::Monitor => {
+            let m = Rect::from_min_max(Pos2::new(l, t + 1.0), Pos2::new(rt, b - 4.0));
+            p.rect_stroke(m, CornerRadius::same(2), s, StrokeKind::Middle);
+            let cx = r.center().x;
+            p.line_segment([Pos2::new(cx, b - 4.0), Pos2::new(cx, b)], s);
+            p.hline(cx - 3.5..=cx + 3.5, b, s);
+        }
+        Glyph::AllMonitors => {
+            let a = Rect::from_min_max(Pos2::new(l, t + 2.0), Pos2::new(l + 7.5, b - 4.0));
+            let c = Rect::from_min_max(Pos2::new(rt - 7.5, t + 2.0), Pos2::new(rt, b - 4.0));
+            p.rect_stroke(a, CornerRadius::same(2), s, StrokeKind::Middle);
+            p.rect_stroke(c, CornerRadius::same(2), s, StrokeKind::Middle);
+            let cx = r.center().x;
+            p.line_segment([Pos2::new(cx, b - 4.0), Pos2::new(cx, b)], s);
+            p.hline(cx - 4.0..=cx + 4.0, b, s);
+        }
+    }
+}
+
+/// Keycaps sized to their text, for right-aligned shortcut rows. Empty
+/// combo → faint "Not set". Painted, so it works in any layout direction.
+pub fn keycaps_compact(ui: &mut Ui, combo: &str) -> Response {
+    let font = FontId::proportional(12.5);
+    let keys: Vec<&str> = combo.split('+').map(str::trim).filter(|k| !k.is_empty()).collect();
+    if keys.is_empty() {
+        return ui.label(RichText::new("Not set").italics().color(TEXT_FAINT));
+    }
+    let galleys: Vec<_> = keys
+        .iter()
+        .map(|k| ui.painter().layout_no_wrap((*k).to_owned(), font.clone(), TEXT))
+        .collect();
+    let (cap_h, pad, gap, min_w) = (24.0, 8.0, 4.0, 24.0);
+    let widths: Vec<f32> = galleys.iter().map(|g| (g.size().x + 2.0 * pad).max(min_w)).collect();
+    let total = widths.iter().sum::<f32>() + gap * (widths.len() - 1) as f32;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(total, cap_h + 2.0), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let mut x = rect.left();
+        for (g, w) in galleys.into_iter().zip(widths) {
+            let cap = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(w, cap_h));
+            let r = CornerRadius::same(6);
+            // Key "depth": a darker lip 2 px under the cap.
+            p.rect_filled(cap.translate(Vec2::new(0.0, 2.0)), r, FIELD);
+            p.rect_filled(cap, r, CONTROL);
+            p.rect_stroke(cap, r, Stroke::new(1.0_f32, BORDER_STRONG), StrokeKind::Inside);
+            let pos = cap.center() - g.size() / 2.0;
+            p.galley(pos, g, TEXT);
+            x += w + gap;
+        }
+    }
+    resp
+}
+
+/// Segmented control writing the raw value of the picked option
+/// (e.g. "png") while showing its label ("PNG").
+pub fn segmented(ui: &mut Ui, value: &mut String, options: &[(&str, &str)]) -> Response {
+    let font = FontId::proportional(13.0);
+    let (h, seg_w, inset) = (30.0, 58.0, 3.0);
+    let size = Vec2::new(seg_w * options.len() as f32 + 2.0 * inset, h);
+    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::hover());
+    let p = ui.painter().clone();
+    p.rect_filled(rect, CornerRadius::same(RADIUS), FIELD);
+    p.rect_stroke(rect, CornerRadius::same(RADIUS), Stroke::new(1.0_f32, BORDER), StrokeKind::Inside);
+    for (i, (raw, label)) in options.iter().enumerate() {
+        let seg = Rect::from_min_size(
+            Pos2::new(rect.left() + inset + seg_w * i as f32, rect.top() + inset),
+            Vec2::new(seg_w, h - 2.0 * inset),
+        );
+        let r = ui.interact(seg, resp.id.with(i), Sense::click());
+        let on = value == raw;
+        r.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, on, *label));
+        if r.clicked() && !on {
+            *value = (*raw).to_owned();
+            resp.mark_changed();
+        }
+        let rr = CornerRadius::same(RADIUS - 2);
+        if on {
+            p.rect_filled(seg, rr, CONTROL_ACTIVE);
+            p.rect_stroke(seg, rr, Stroke::new(1.0_f32, BORDER_STRONG), StrokeKind::Inside);
+        } else if r.hovered() {
+            p.rect_filled(seg, rr, CONTROL);
+        }
+        if r.has_focus() {
+            p.rect_stroke(seg, rr, Stroke::new(1.5_f32, ACCENT_HOVER), StrokeKind::Outside);
+        }
+        let color = if on { TEXT } else { TEXT_MUTED };
+        let font = if on { FontId::proportional(13.0) } else { font.clone() };
+        p.text(seg.center(), Align2::CENTER_CENTER, *label, font, color);
+        resp |= r;
+    }
+    resp
+}
+
+/// Smaller secondary button (28 px) for use inside list rows.
+pub fn compact_button(ui: &mut Ui, text: &str) -> Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = Vec2::new(10.0, 4.0);
+        ui.add(egui::Button::new(RichText::new(text).size(13.0)).min_size(Vec2::new(0.0, 28.0)))
+    })
+    .inner
+}
+
+/// Text-only button that turns red on hover (Clear in the shortcut editor).
+pub fn danger_link(ui: &mut Ui, text: &str) -> Response {
+    ui.scope(|ui| {
+        let w = &mut ui.visuals_mut().widgets;
+        w.hovered.fg_stroke.color = RED;
+        w.active.fg_stroke.color = RED;
+        ui.add(
+            egui::Button::new(RichText::new(text).color(TEXT_MUTED))
+                .frame(false)
+                .min_size(Vec2::new(0.0, 32.0)),
+        )
+    })
+    .inner
+}
+
+/// Amber notice strip with an action, for "Shortcuts aren't on yet".
+pub fn notice<R>(ui: &mut Ui, text: &str, action: impl FnOnce(&mut Ui) -> R) -> R {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H + 4.0), Sense::hover());
+    let p = ui.painter();
+    let inner = rect.shrink(4.0);
+    p.rect_filled(inner, CornerRadius::same(RADIUS), AMBER.gamma_multiply(0.12));
+    p.circle_filled(Pos2::new(inner.left() + 16.0, inner.center().y), 4.0, AMBER);
+    p.text(Pos2::new(inner.left() + 28.0, inner.center().y), Align2::LEFT_CENTER, text, FontId::proportional(13.0), TEXT);
+    ui.scope_builder(
+        UiBuilder::new()
+            .max_rect(inner.shrink2(Vec2::new(8.0, 0.0)))
+            .layout(Layout::right_to_left(Align::Center)),
+        action,
     )
+    .inner
 }
 
 fn line(width: f32, color: Color32) -> Stroke {
@@ -395,9 +584,8 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let r = toggle(ui, &mut on);
                 assert!(!r.changed());
-                card(ui, "Saving", |ui| row(ui, "Format", |ui| hint(ui, "png")));
                 primary_button(ui, "Save");
-                status_pill(ui, GREEN, "Replay on · 60 s");
+                status_pill(ui, GREEN, "Running");
             });
         });
         assert!(!on);
