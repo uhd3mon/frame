@@ -69,7 +69,7 @@ Esc cancels, Meta/Ctrl/Alt/Shift chips + key combo, hint) stays.
 | Row with subtitle (`ROW_H_TALL`) | 54 pt |
 | Row padding left/right (`ROW_PAD_X`) | 14 pt |
 | Title / subtitle | 14 TEXT / 12 TEXT_FAINT, 3 pt apart |
-| Glyph tile | 28 pt, radius 7, ACCENT at 16 %; 16 pt glyph, 1.6 stroke, ACCENT_HOVER |
+| Glyph tile | 28 pt, radius 7, TILE_FILL (grey); 16 pt glyph, 1.6 stroke, ACCENT_HOVER |
 | Hairline | 1 px BORDER, from the text column (after the tile) to the card's right edge |
 | Row hover / focus | inset 4, radius 8, CONTROL at 70 %; focus adds a 1.5 ACCENT_HOVER ring |
 | Chevron | 3×10 pt, 1.6 stroke, TEXT_FAINT (TEXT_MUTED on hover), 18 pt reserved |
@@ -85,27 +85,40 @@ Rules:
 - Hairlines only inside list cards; spacing groups the cards.
 - Show friendly text (PNG, WebP) while writing raw config values.
 
-## Colours (dark theme)
+## Colours (dark theme, neutral grey)
+
+Since 2026-10-29 every surface is a neutral grey (R = G = B; Kevin wanted
+dark grey, not navy). Blue only marks meaning: toggles on, the selected
+editor chips, Save / Turn on / Install / Set / Stop, focus rings, the
+text cursor and the row glyphs (they tie to the app icon). The selected
+format segment stays a grey lift. GREEN and AMBER are unchanged.
 
 | Token | Hex | Use |
 |---|---|---|
-| BG | `#15171C` | window / page background |
-| FIELD | `#111317` | text fields, segmented track, keycap lip |
-| CARD | `#1D2027` | cards, bottom bar, popups |
-| CONTROL | `#272B34` | buttons, combos, keycaps, toggle off |
-| CONTROL_HOVER | `#303540` | hovered control |
-| CONTROL_ACTIVE | `#383E4A` | pressed / open control, selected segment |
-| BORDER | `#2B2F38` | card outlines, hairlines |
-| BORDER_STRONG | `#3A404C` | hovered outline, keycap edge |
-| TEXT | `#E6E9EF` | body text |
-| TEXT_MUTED | `#9AA2B1` | group titles, secondary text |
-| TEXT_FAINT | `#6B7380` | subtitles, hints, "Not set" |
-| ACCENT | `#3D8BFF` | Save, toggles on, focus, glyph tiles |
+| BG | `#1E1E1E` | window / page background, header |
+| FIELD | `#181818` | text fields, segmented track, keycap lip |
+| CARD | `#2A2A2A` | cards, bottom bar, editor modal, popups, tooltips |
+| CONTROL | `#383838` | buttons, combos, keycaps, scrollbar |
+| CONTROL_HOVER | `#424242` | hovered control |
+| CONTROL_ACTIVE | `#4C4C4C` | pressed / open control, selected segment, toggle off |
+| BORDER | `#444444` | card outlines, hairlines, separators |
+| BORDER_STRONG | `#4E4E4E` | hovered outline, keycap edge, modal outline |
+| TILE_FILL | `#363636` | glyph tile on shortcut rows |
+| TEXT | `#ECECEC` | body text |
+| TEXT_MUTED | `#A8A8A8` | group titles, secondary text |
+| TEXT_FAINT | `#929292` | subtitles, hints, "Not set" |
+| ACCENT | `#3D8BFF` | Save, toggles on, selected chips |
 | ACCENT_HOVER | `#5A9CFF` | hovered accent, glyphs, focus rings |
 | ACCENT_PRESSED | `#2F74E0` | pressed accent |
 | RED | `#F0414B` | errors, Clear hover |
 | GREEN | `#34C77B` | "Running", "Saved." |
-| AMBER | `#F5B544` | unsaved changes, "shortcuts off" notice |
+| AMBER | `#F5B544` | unsaved changes, "shortcuts off" / install notice |
+
+The editor backdrop is black at 150/255 (`settings.rs`). Shots of the
+grey theme: `shots/frame-settings-gray.png`,
+`shots/frame-shortcut-editor-gray.png`,
+`shots/frame-settings-install-gray.png`. The navy palette before it
+(BG `#15171C`, CARD `#1D2027`, …) is in git history.
 
 App icon gradient `#5A9CFF` → `#1F5BD8` (top-left to bottom-right),
 white marks. Tray (`frame-tray.svg`): viewfinder corners (2.75 stroke on a

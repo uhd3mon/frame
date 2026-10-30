@@ -2,12 +2,13 @@
 //! before it replaces the real file, and re-applies shortcuts.
 
 use crate::config::{self, ACTIONS};
+use crate::ctx::Ctx;
 use crate::state;
 use crate::theme;
 use eframe::egui::{self, Color32, RichText};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 /// Free-text fields: edge spaces are trimmed on Save.
@@ -19,6 +20,8 @@ enum Msg {
     Folder(PathBuf),
     /// Result of `frame bind`; it replaces "Updating shortcuts…" in the status.
     Rebind(String, bool),
+    /// Result of Install: the installed binary, or why not.
+    Installed(Result<PathBuf, String>),
 }
 
 /// self_shot's frame count once the screenshot is asked for.
@@ -28,7 +31,7 @@ const UPDATING: &str = "Updating shortcuts…";
 
 const ACTION_NAMES: [&str; 4] = ["Region", "Window", "Monitor", "All monitors"];
 
-/// The keys the editor offers (bin/frame key_info takes them all, plus
+/// The keys the editor offers (keys::parse takes them all, plus
 /// F25–F35 and spelling variants).
 fn key_choices() -> Vec<String> {
     let mut v: Vec<String> = [
@@ -319,6 +322,9 @@ struct App {
     shot_end: bool,
     /// Header pill: is the tray running.
     live: bool,
+    /// The "Install Frame" notice (AppImage, not installed yet).
+    offer_install: bool,
+    installing: bool,
     live_at: Option<std::time::Instant>,
     icon: Option<egui::TextureHandle>,
 }
@@ -337,7 +343,7 @@ pub fn run() -> i32 {
     let event_loop = match winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event().build() {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("frame-gui: {e}");
+            eprintln!("frame: {e}");
             return 1;
         }
     };
@@ -357,53 +363,45 @@ pub fn run() -> i32 {
     match event_loop.run_app(&mut tap) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("frame-gui: {e}");
+            eprintln!("frame: {e}");
             1
         }
     }
 }
 
-fn run_clip(args: &[&str], config: Option<&Path>) -> Result<Output, String> {
-    let bin = crate::clip_bin();
-    let mut c = Command::new(&bin);
-    c.args(args);
-    if let Some(p) = config {
-        c.env("FRAME_CONFIG", p);
+/// `frame bind`, in this process: Ok(warnings) or Err(why).
+fn frame_bind() -> Result<String, String> {
+    #[cfg(test)]
+    if let Some(f) = std::env::var_os("FRAME_TEST_CALLS") {
+        use std::io::Write;
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(f).and_then(|mut f| f.write_all(b"bind\n"));
     }
-    c.output().map_err(|e| format!("cannot run {}: {e}", bin.display()))
-}
-
-fn stderr_of(o: &Output) -> String {
-    let e = String::from_utf8_lossy(&o.stderr).trim().to_string();
-    if e.is_empty() {
-        format!("exit code {}", o.status.code().unwrap_or(-1))
-    } else {
-        e
+    let ctx = Ctx::process_captured();
+    let warn = |ctx: &Ctx| ctx.output().1.trim().to_string();
+    let (cfg, _) = crate::config::load(&ctx.config_path(), &ctx.home())?;
+    match crate::binds::bind(&ctx, &cfg) {
+        Ok(()) => Ok(warn(&ctx)),
+        Err(e) => Err([warn(&ctx), e].join(" ").trim().to_string()),
     }
 }
 
-/// Escape a path for a desktop entry Exec= line (same as desktop_arg in bin/frame).
-pub fn desktop_exec_arg(p: &str) -> String {
-    if p.chars().all(|c| c.is_ascii_alphanumeric() || "/._+-".contains(c)) {
-        return p.to_string();
-    }
-    let mut s = String::from("\"");
-    for c in p.chars() {
-        if matches!(c, '\\' | '"' | '`' | '$') {
-            s.push('\\');
-        }
-        s.push(c);
-    }
-    s.push('"');
-    s.replace('\\', "\\\\").replace('%', "%%")
+pub use crate::install::autostart_entry;
+
+/// Running from the AppImage and not installed: the window offers Install
+/// (KWin <= 6.7 only lets an installed frame take screenshots, and the
+/// menu entry and icons come with it).
+fn offer_install() -> bool {
+    let ctx = Ctx::process();
+    ctx.var_os("APPIMAGE").is_some() && crate::install::installed(&ctx).is_none()
 }
 
-pub fn autostart_entry(exe: &str) -> String {
-    format!(
-        "[Desktop Entry]\nType=Application\nName=Frame\nComment=Frame tray: screenshot shortcuts\nExec={}\nIcon=frame\n\
-         Terminal=false\nX-GNOME-Autostart-enabled=true\n",
-        desktop_exec_arg(exe)
-    )
+/// `frame install` in this process (this binary, from the AppImage's mount).
+fn run_install() -> Result<PathBuf, String> {
+    let ctx = Ctx::process_captured();
+    let opts = crate::install::Opts { force: false, autostart: true, from: None };
+    let r = crate::install::Layout::new(&ctx).and_then(|l| crate::install::install(&ctx, &l, &opts).map(|()| l.bin()));
+    let warn = ctx.output().1.trim().to_string();
+    r.map_err(|e| [warn, e].join(" ").trim().to_string())
 }
 
 /// The config bytes, None if there is no file (or only a dangling
@@ -445,7 +443,7 @@ pub fn write_checked(path: &Path, text: &[u8]) -> Result<(), String> {
     let mode = std::fs::metadata(&real).ok().map(|m| m.permissions().mode() & 0o7777);
     let mut opened = None;
     for i in 0..100 {
-        let tmp = dir.join(format!(".{name}.frame-gui-{}-{i}.tmp", std::process::id()));
+        let tmp = dir.join(format!(".{name}.frame-{}-{i}.tmp", std::process::id()));
         match std::fs::OpenOptions::new().write(true).create_new(true).mode(mode.unwrap_or(0o644)).open(&tmp) {
             Ok(f) => {
                 opened = Some((tmp, f));
@@ -466,11 +464,7 @@ pub fn write_checked(path: &Path, text: &[u8]) -> Result<(), String> {
     drop(f);
     let checked = match written {
         Err(e) => Err(format!("Not saved: {}: {e}", tmp.display())),
-        Ok(()) => match run_clip(&["check"], Some(&tmp)) {
-            Ok(o) if o.status.success() => Ok(()),
-            Ok(o) => Err(format!("Not saved: {}", stderr_of(&o))),
-            Err(e) => Err(format!("Not saved: {e}")),
-        },
+        Ok(()) => crate::cli::check_file(&Ctx::process(), &tmp).map_err(|e| format!("Not saved: {e}")),
     };
     if let Err(e) = checked {
         let _ = std::fs::remove_file(&tmp);
@@ -486,24 +480,14 @@ pub fn write_checked(path: &Path, text: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// The text `frame config` would write, made in a temp path (not the real one).
-fn template(dir: &Path) -> String {
-    let t = dir.join(format!(".frame-gui-template-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(dir);
-    let _ = run_clip(&["config"], Some(&t));
-    let text = std::fs::read_to_string(&t).unwrap_or_default();
-    let _ = std::fs::remove_file(&t);
-    text
-}
-
 impl App {
     fn new(ctx: &egui::Context) -> App {
         let (tx, rx) = channel();
         let path = state::config_path();
-        // A first start after the rename: `frame check` copies the Clipped
-        // config to the new place before we read it.
+        // A first start after the rename: copy the Clipped config to the
+        // new place before we read it.
         if !cfg!(test) && matches!(read_config(&path), Ok(None)) {
-            let _ = run_clip(&["check"], None);
+            crate::cli::migrate_config(&Ctx::process());
         }
         let mut app = App {
             path,
@@ -524,6 +508,8 @@ impl App {
             shot_end: false,
             live: Default::default(),
             live_at: None,
+            offer_install: offer_install(),
+            installing: false,
             icon: crate::icons::rgba(HEADER_ICON).map(|(w, h, rgba)| {
                 let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
                 ctx.load_texture("frame-icon", img, egui::TextureOptions::LINEAR)
@@ -606,7 +592,7 @@ impl App {
             // since load. Only a missing file means "start from the template".
             let base = match read_config(&self.path) {
                 Ok(Some(t)) => t,
-                Ok(None) => template(self.path.parent().unwrap_or(Path::new("."))).into_bytes(),
+                Ok(None) => crate::config::DEFAULT_TEXT.as_bytes().to_vec(),
                 Err(e) => return self.set_status(format!("Not saved: {e}"), true),
             };
             let result = config::apply(&base, &changes).and_then(|text| write_checked(&self.path, &text));
@@ -642,8 +628,9 @@ impl App {
         if !self.autostart {
             return std::fs::remove_file(&f).or_else(|e| if f.exists() { Err(e) } else { Ok(()) }).map_err(|e| format!("{}: {e}", f.display()));
         }
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let exe = exe.canonicalize().unwrap_or(exe);
+        // FRAME_BIN ($APPIMAGE) or the installed frame, never the
+        // AppImage's temporary /tmp/.mount_* binary.
+        let exe = crate::install::stable_exe(&Ctx::process())?;
         if let Some(d) = f.parent() {
             std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
         }
@@ -656,10 +643,9 @@ impl App {
         self.rebinding = true;
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
-            let msg = match run_clip(&["bind"], None) {
-                Ok(o) if o.status.success() && o.stderr.is_empty() => ("Shortcuts updated.".into(), false),
-                Ok(o) if o.status.success() => (format!("Shortcuts updated; {}", stderr_of(&o)), false),
-                Ok(o) => (format!("Shortcuts failed: {}", stderr_of(&o)), true),
+            let msg = match frame_bind() {
+                Ok(w) if w.is_empty() => ("Shortcuts updated.".into(), false),
+                Ok(w) => (format!("Shortcuts updated; {w}"), false),
                 Err(e) => (format!("Shortcuts failed: {e}"), true),
             };
             let _ = tx.send(Msg::Rebind(msg.0, msg.1));
@@ -696,6 +682,23 @@ impl App {
                         format!("{} {s}", self.status).trim_start().to_string()
                     };
                     self.error |= e;
+                }
+                Msg::Installed(r) => {
+                    self.installing = false;
+                    match r {
+                        Ok(bin) => {
+                            self.offer_install = false;
+                            // Later Saves bind shortcuts to the installed
+                            // frame, not to this AppImage.
+                            std::env::set_var("FRAME_BIN", &bin);
+                            if self.autostart == self.autostart_loaded {
+                                self.autostart_loaded = state::autostart_file().exists();
+                                self.autostart = self.autostart_loaded;
+                            }
+                            self.set_status(format!("Installed: {}.", tilde(&bin)), false);
+                        }
+                        Err(e) => self.set_status(format!("Not installed: {e}"), true),
+                    }
                 }
             }
         }
@@ -775,7 +778,7 @@ impl App {
             w.write_image_data(img.as_raw()).map_err(|e| e.to_string())
         });
         if let Err(e) = r {
-            eprintln!("frame-gui: {}: {e}", path.display());
+            eprintln!("frame: {}: {e}", path.display());
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
@@ -907,6 +910,31 @@ impl App {
                 });
             });
         });
+    }
+
+    /// One line and a button, shown only when running from the AppImage
+    /// and Frame isn't installed.
+    fn install_notice(&mut self, ui: &mut egui::Ui) {
+        if !self.offer_install {
+            return;
+        }
+        theme::notice(ui, "Frame isn't installed yet", |ui| {
+            if self.installing {
+                ui.spinner();
+            } else if theme::primary_button(ui, "Install Frame")
+                .on_hover_text("Copies Frame to ~/.local/bin with a menu entry, so every desktop lets it take screenshots")
+                .clicked()
+            {
+                self.installing = true;
+                self.set_status("Installing…".into(), false);
+                let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(Msg::Installed(run_install()));
+                    ctx.request_repaint();
+                });
+            }
+        });
+        ui.add_space(6.0);
     }
 
     fn shortcuts_group(&mut self, ui: &mut egui::Ui) {
@@ -1132,6 +1160,7 @@ impl App {
         egui::CentralPanel::default().frame(theme::page_frame()).show(ctx, |ui| {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
+                self.install_notice(ui);
                 self.shortcuts_group(ui);
                 ui.add_space(6.0);
                 self.saving_group(ui);
@@ -1153,7 +1182,7 @@ fn open_folder(dir: PathBuf) {
     std::thread::spawn(move || {
         let _ = std::fs::create_dir_all(&dir);
         if let Err(e) = Command::new("xdg-open").arg(&dir).status() {
-            eprintln!("frame-gui: xdg-open: {e}");
+            eprintln!("frame: xdg-open: {e}");
         }
     });
 }
@@ -1173,10 +1202,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exec_quoting_matches_bash() {
-        assert_eq!(desktop_exec_arg("/home/u/.local/bin/frame-gui"), "/home/u/.local/bin/frame-gui");
-        // Same expectation as the "quoting helpers" check in tests/smoke.sh.
-        assert_eq!(desktop_exec_arg("/a b/$x%\"q\\"), "\"/a b/\\\\$x%%\\\\\"q\\\\\\\\\"");
+    fn exec_quoting() {
+        assert_eq!(crate::ctx::desktop_arg("/home/u/.local/bin/frame"), "/home/u/.local/bin/frame");
+        // install.sh's desktop_arg gives the same (tests/smoke.sh checks it).
+        assert_eq!(crate::ctx::desktop_arg("/a b/$x%\"q\\"), "\"/a b/\\\\$x%%\\\\\"q\\\\\\\\\"");
     }
 
     #[test]
@@ -1304,10 +1333,9 @@ mod tests {
     /// Everything Record can finish with is a value `frame check` accepts.
     #[test]
     fn record_output_passes_frame_check() {
-        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("rec");
-        test_env(&d, &frame);
+        test_env(&d);
         let cfg = d.join("config");
         for (evs, want) in recorded_combos() {
             if want.starts_with(['-', '…']) {
@@ -1316,8 +1344,8 @@ mod tests {
             let text = record(&evs).0;
             assert!(config::valid_shortcut(&text), "{text}");
             std::fs::write(&cfg, format!("bind.region = {text}\n")).unwrap();
-            let o = run_clip(&["check"], Some(&cfg)).unwrap();
-            assert!(o.status.success(), "{text}: {}", stderr_of(&o));
+            let o = crate::cli::check_file(&Ctx::process(), &cfg);
+            assert!(o.is_ok(), "{text}: {o:?}");
         }
     }
 
@@ -1327,7 +1355,7 @@ mod tests {
     fn editor_keys_dont_overwrite() {
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("edkeys");
-        test_env(&d, Path::new("/nonexistent"));
+        test_env(&d);
         let ctx = egui::Context::default();
         let mut app = App::new(&ctx);
         app.path = d.join("config");
@@ -1371,16 +1399,16 @@ mod tests {
     #[test]
     fn autostart_entry_validates() {
         let d = crate::testutil::tempdir("auto");
-        let f = d.join("frame-gui.desktop");
-        std::fs::write(&f, autostart_entry("/opt/my frame/frame-gui")).unwrap();
+        let f = d.join("frame.desktop");
+        std::fs::write(&f, autostart_entry("/opt/my frame/frame")).unwrap();
         let text = std::fs::read_to_string(&f).unwrap();
-        assert!(text.contains("Exec=\"/opt/my frame/frame-gui\"\n"), "{text}");
+        assert!(text.contains("Exec=\"/opt/my frame/frame\" tray\n"), "{text}");
         assert!(text.contains("X-GNOME-Autostart-enabled=true"));
         // install.sh writes the same text (tests/smoke.sh checks its copy).
         assert_eq!(
-            autostart_entry("/p/frame-gui"),
+            autostart_entry("/p/frame"),
             "[Desktop Entry]\nType=Application\nName=Frame\nComment=Frame tray: screenshot shortcuts\n\
-             Exec=/p/frame-gui\nIcon=frame\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+             Exec=/p/frame tray\nIcon=frame\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
         );
         if let Ok(o) = Command::new("desktop-file-validate").arg(&f).output() {
             assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
@@ -1402,27 +1430,23 @@ mod tests {
         assert_eq!(pill(false).1, "Not running");
     }
 
-    fn clip_script() -> Option<PathBuf> {
-        let frame = Path::new(env!("CARGO_MANIFEST_DIR")).join("../bin/frame");
-        frame.exists().then_some(frame)
-    }
-
     /// Temp XDG dirs, dry-run frame and a desktop with no shortcut backend,
-    /// so nothing here can touch the real session. FRAME_BIN logs each call
-    /// to D/calls, then runs bin/frame.
-    fn test_env(d: &Path, frame: &Path) {
+    /// so nothing here can touch the real session. Each `frame bind` is
+    /// logged to D/calls.
+    fn test_env(d: &Path) {
         for (k, sub) in [("XDG_CONFIG_HOME", "cfg"), ("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"), ("XDG_CACHE_HOME", "cache")] {
             std::fs::create_dir_all(d.join(sub)).unwrap();
             std::env::set_var(k, d.join(sub));
         }
-        let wrap = d.join("frame-wrap");
-        std::fs::write(&wrap, format!("#!/bin/sh\necho \"$*\" >>'{}/calls'\nexec '{}' \"$@\"\n", d.display(), frame.display())).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrap, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::env::set_var("FRAME_BIN", &wrap);
+        std::env::set_var("FRAME_TEST_CALLS", d.join("calls"));
+        std::env::set_var("FRAME_BIN", "/opt/frame/bin/frame");
         std::env::set_var("FRAME_DRY_RUN", "1");
         std::env::set_var("XDG_CURRENT_DESKTOP", "frame-test");
         std::env::remove_var("FRAME_CONFIG");
+        // Install checks look here, never at the real ~/.local.
+        std::env::set_var("PREFIX", d.join("pfx"));
+        std::env::remove_var("APPIMAGE");
+        std::env::remove_var("APPDIR");
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
         std::env::remove_var("SWAYSOCK");
     }
@@ -1452,10 +1476,9 @@ mod tests {
     #[test]
     fn unreadable_config_is_never_replaced() {
         use std::os::unix::fs::PermissionsExt;
-        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("unread");
-        test_env(&d, &frame);
+        test_env(&d);
         let cfg = d.join("cfg/frame/config");
         std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
         let mine = "# mine\nnotify = false\n";
@@ -1490,10 +1513,9 @@ mod tests {
     /// Save keeps every other byte.
     #[test]
     fn non_utf8_config_is_edited_in_place() {
-        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("latin1");
-        test_env(&d, &frame);
+        test_env(&d);
         let cfg = d.join("config");
         std::fs::write(&cfg, b"# caf\xe9\r\nnotify = false   # \xe9\nimage_format = png\n").unwrap();
         let mut app = app_at(&cfg);
@@ -1511,10 +1533,9 @@ mod tests {
     /// The Save button end to end, headless, in temp XDG dirs.
     #[test]
     fn save_flow() {
-        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("save");
-        test_env(&d, &frame);
+        test_env(&d);
         let mut app = app_at(&d.join("cfg/frame/config"));
         assert!(app.status.contains("No config file yet"));
 
@@ -1558,22 +1579,34 @@ mod tests {
         app.autostart = true;
         app.save();
         wait_rebind(&mut app);
-        let auto = d.join("cfg/autostart/frame-gui.desktop");
-        assert!(std::fs::read_to_string(&auto).unwrap().contains("X-GNOME-Autostart-enabled=true"));
+        let auto = d.join("cfg/autostart/frame.desktop");
+        let text = std::fs::read_to_string(&auto).unwrap();
+        assert!(text.contains("\nExec=/opt/frame/bin/frame tray\n") && text.contains("X-GNOME-Autostart-enabled=true"), "{text}");
         app.autostart = false;
         app.save();
         wait_rebind(&mut app);
         assert!(!auto.exists() && !app.error, "{}", app.status);
+
+        // From the AppImage: the .AppImage file, never the binary in its
+        // temporary mount (current_exe); the window offers Install.
+        std::env::set_var("APPIMAGE", d.join("Frame.AppImage"));
+        assert!(offer_install());
+        app.autostart = true;
+        app.save();
+        wait_rebind(&mut app);
+        let text = std::fs::read_to_string(&auto).unwrap();
+        assert!(text.contains(&format!("\nExec={}/Frame.AppImage tray\n", d.display())), "{text}");
+        std::env::remove_var("APPIMAGE");
+        assert!(!offer_install());
     }
 
     /// Kevin's case: installed, never bound. Any Save runs `frame bind`;
     /// once frame has bound, a Save without bind.* changes doesn't.
     #[test]
     fn first_save_binds() {
-        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("firstbind");
-        test_env(&d, &frame);
+        test_env(&d);
         let cfg = d.join("config");
         std::fs::write(&cfg, "image_format = png\n").unwrap();
         let mut app = app_at(&cfg);
@@ -1600,10 +1633,9 @@ mod tests {
     /// loads without an error, and Save keeps those lines as they are.
     #[test]
     fn old_video_config_still_saves() {
-        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("oldcfg");
-        test_env(&d, &frame);
+        test_env(&d);
         let cfg = d.join("config");
         let old = "image_format = png\nvideo_format = mp4\nreplay = false\nreplay_seconds = auto\nvideo_source = DP-2\n\
                    video_fps = 60\nvideo_quality = very_high\nvideo_codec = auto\naudio = default_output\n\
@@ -1623,16 +1655,15 @@ mod tests {
     /// widget's fallback), and is what Save keeps.
     #[test]
     fn unparseable_value_is_kept_raw() {
-        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("raw");
-        test_env(&d, &frame);
+        test_env(&d);
         let cfg = d.join("config");
         // Every image format the window offers is a value frame check takes.
         for (v, _) in IMAGE_FORMATS {
             std::fs::write(&cfg, format!("image_format = {v}\n")).unwrap();
-            let o = run_clip(&["check"], Some(&cfg)).unwrap();
-            assert!(o.status.success(), "{v}: {}", stderr_of(&o));
+            let o = crate::cli::check_file(&Ctx::process(), &cfg);
+            assert!(o.is_ok(), "{v}: {o:?}");
         }
         std::fs::write(&cfg, "image_format = gif\nnotify = maybe\n").unwrap();
         let mut app = app_at(&cfg);
@@ -1654,10 +1685,9 @@ mod tests {
     /// and rebinds, and the rebind result is added to the status.
     #[test]
     fn rebind_once_and_errors_collected() {
-        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("rebind");
-        test_env(&d, &frame);
+        test_env(&d);
         std::fs::create_dir_all(d.join("state/frame")).unwrap();
         std::fs::write(d.join("state/frame/binds"), "manual\n").unwrap(); // frame has bound before
         std::fs::write(d.join("cfg/autostart"), "a file, so the autostart dir can't be made").unwrap();
@@ -1686,10 +1716,9 @@ mod tests {
     /// link stays a link.
     #[test]
     fn symlinked_config_writes_target() {
-        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("link");
-        test_env(&d, &frame);
+        test_env(&d);
         std::fs::create_dir_all(d.join("dots")).unwrap();
         std::fs::create_dir_all(d.join("cfg/frame")).unwrap();
         let link = d.join("cfg/frame/config");
@@ -1711,14 +1740,13 @@ mod tests {
     #[test]
     fn write_checked_modes() {
         use std::os::unix::fs::PermissionsExt;
-        let Some(frame) = clip_script() else { return };
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("mode");
-        test_env(&d, &frame);
+        test_env(&d);
         let cfg = d.join("config");
         std::fs::write(&cfg, "notify = true\n").unwrap();
         std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let planted = d.join(format!(".config.frame-gui-{}-0.tmp", std::process::id()));
+        let planted = d.join(format!(".config.frame-{}-0.tmp", std::process::id()));
         std::fs::write(&planted, "planted").unwrap();
         write_checked(&cfg, b"notify = false\n").unwrap();
         assert_eq!(std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o7777, 0o600);
@@ -1735,14 +1763,13 @@ mod tests {
         assert_eq!(std::fs::metadata(&new).unwrap().permissions().mode() & 0o7777, 0o644 & !umask);
     }
 
-    /// write_checked against the real bin/frame: a bad value leaves the file
-    /// alone, a good one replaces it (skipped without bash).
+    /// write_checked runs the check: a bad value leaves the file alone, a
+    /// good one replaces it.
     #[test]
-    fn write_checked_uses_clip_check() {
-        let Some(frame) = clip_script() else { return };
+    fn write_checked_runs_check() {
         let _env = crate::testutil::env_lock();
         let d = crate::testutil::tempdir("wc");
-        test_env(&d, &frame);
+        test_env(&d);
         let cfg = d.join("config");
         std::fs::write(&cfg, "image_format = png # mine\n").unwrap();
         let err = write_checked(&cfg, b"image_format = gif # mine\n").unwrap_err();
@@ -1754,9 +1781,9 @@ mod tests {
         left.retain(|n| n.to_string_lossy().starts_with(".config"));
         assert!(left.is_empty(), "temp files left behind: {left:?}");
 
-        let t = template(&d);
+        let t = config::DEFAULT_TEXT;
         assert!(t.contains("bind.all = Meta+Alt+A") && t.contains("# frame config") && !t.contains("video"));
-        let defaults = config::parse(&t);
+        let defaults = config::parse(t);
         for (k, v) in config::DEFAULTS {
             assert_eq!(defaults[*k], *v, "default_config() and DEFAULTS disagree on {k}");
         }

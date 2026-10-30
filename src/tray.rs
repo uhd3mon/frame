@@ -3,7 +3,7 @@
 //! Hyprland and Sway forget runtime binds when the session ends, so the
 //! tray (started at login) puts them back. Menu items run frame detached.
 
-use crate::{clip_detached, config, icons, state};
+use crate::{config, frame_detached, icons, state};
 use ksni::blocking::TrayMethods;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +25,7 @@ fn item(label: &str, f: impl Fn(&mut ClipTray) + Send + 'static) -> ksni::MenuIt
 }
 
 fn shot(label: &str, mode: &'static str) -> ksni::MenuItem<ClipTray> {
-    item(label, move |_| clip_detached(&[mode]))
+    item(label, move |_| frame_detached(&[mode]))
 }
 
 impl ksni::Tray for ClipTray {
@@ -62,12 +62,12 @@ impl ksni::Tray for ClipTray {
     }
 }
 
-/// <save_dir>/frame/images, where bin/frame saves screenshots.
+/// <save_dir>/frame/images, where screenshots are saved.
 fn open_folder() {
     let text = std::fs::read(state::config_path()).unwrap_or_default();
     let dir = state::expand_dir(&config::parse(&text)["save_dir"]).join("frame/images");
     let _ = std::fs::create_dir_all(&dir);
-    crate::spawn_detached(Command::new("xdg-open").arg(dir));
+    let _ = crate::ctx::spawn_detached(Command::new("xdg-open").arg(dir));
 }
 
 /// Run the tray until Quit or a signal.
@@ -81,7 +81,7 @@ pub fn run() -> i32 {
     let rundir = match state::ensure_rundir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("frame-gui: {e}");
+            eprintln!("frame: {e}");
             return 1;
         }
     };
@@ -89,15 +89,15 @@ pub fn run() -> i32 {
     let handle = match tray.assume_sni_available(true).spawn() {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("frame-gui: cannot show the tray icon: {e}");
+            eprintln!("frame: cannot show the tray icon: {e}");
             return 1;
         }
     };
     let pidfile = state::tray_pid_file(&rundir);
     if let Err(e) = state::write_own_pid(&pidfile) {
-        eprintln!("frame-gui: {}: {e}", pidfile.display());
+        eprintln!("frame: {}: {e}", pidfile.display());
     }
-    clip_detached(&["bind"]);
+    frame_detached(&["bind"]);
     while !QUIT.load(Ordering::SeqCst) && !handle.is_closed() {
         std::thread::sleep(Duration::from_millis(200));
     }

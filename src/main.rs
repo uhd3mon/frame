@@ -1,44 +1,51 @@
-//! frame-gui: tray icon and settings window for frame. bin/frame does the
-//! work; this only shows its state, runs its commands and edits its config.
-//! The one exception is --grab: KWin hands screenshots only to a compiled
-//! binary named in a .desktop file, so bin/frame calls us for that on KDE.
+//! frame: screenshots with global shortcuts on any Linux desktop. One
+//! binary: the command line (screenshots, shortcuts, config), the tray
+//! icon and the settings window.
 //!
-//!   frame-gui             tray (one per session; if it runs, open settings)
-//!   frame-gui --open      tray if not running, and the settings window
-//!   frame-gui --settings  the settings window only (one at a time)
-//!   frame-gui --grab MODE [X Y W H] OUT.png   KDE screenshot (used by frame)
+//!   frame                 tray if not running, and the settings window
+//!   frame tray            tray (one per session; if it runs, open settings)
+//!   frame settings        the settings window only (one at a time)
+//!   frame region|window|monitor|all, bind, unbind, check, ...   see --help
+//!   frame install / uninstall   copy this binary to ~/.local (the AppImage too)
+//!   frame --grab MODE [X Y W H] OUT.png   KDE screenshot via KWin (debugging)
+//!   frame _toast / _clip  internal: a notification / the clipboard,
+//!                         each detached from the shortcut that started it
 
+mod binds;
+mod cli;
 mod config;
+mod ctx;
+mod detect;
 mod grab;
 mod icons;
+mod install;
+mod ipc;
+mod keys;
+mod notify;
+mod pixels;
+mod portal;
+mod select;
 mod settings;
+mod shot;
 mod state;
 mod theme;
 mod tray;
+mod wl;
+mod wlclip;
+mod x11;
 
 use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
-        None => run_tray(false),
-        Some("--open") => run_tray(true),
-        Some("--settings") => run_settings(),
+        None => run_tray(true),
+        Some("tray") => run_tray(false),
+        Some("settings") => run_settings(),
         Some("--grab") => grab::main(&args[1..]),
-        Some("--version") => {
-            println!("frame-gui {}", env!("CARGO_PKG_VERSION"));
-            0
-        }
-        Some("-h" | "--help") => {
-            println!("Usage: frame-gui [--open | --settings | --version | --grab MODE [X Y W H] OUT.png]");
-            0
-        }
-        Some(a) => {
-            eprintln!("frame-gui: unknown option {a}");
-            2
-        }
+        Some("_clip") => wlclip::main(&args[1..]),
+        _ => cli::run(&ctx::Ctx::process(), &args),
     };
     std::process::exit(code);
 }
@@ -60,7 +67,7 @@ fn run_tray(open_settings: bool) -> i32 {
     let lock = match take_lock("gui.lock") {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("frame-gui: {e}");
+            eprintln!("frame: {e}");
             return 1;
         }
     };
@@ -86,66 +93,24 @@ fn run_settings() -> i32 {
         }
         Ok(None) => 0, // a settings window is already open
         Err(e) => {
-            eprintln!("frame-gui: {e}");
+            eprintln!("frame: {e}");
             1
         }
     }
 }
 
 pub fn spawn_settings() {
-    match std::env::current_exe() {
-        Ok(exe) => spawn_detached(Command::new(exe).arg("--settings")),
-        Err(e) => eprintln!("frame-gui: {e}"),
-    }
+    frame_detached(&["settings"]);
 }
 
-/// Start a command in its own process group, without waiting for it; a
-/// thread reaps it so no zombie is left.
-pub fn spawn_detached(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).process_group(0);
-    match cmd.spawn() {
-        Ok(mut child) => {
-            std::thread::spawn(move || child.wait());
-        }
-        Err(e) => eprintln!("frame-gui: cannot run {:?}: {e}", cmd.get_program()),
+/// `frame ARGS…` (this binary) detached: screenshots, bind, settings.
+pub fn frame_detached(args: &[&str]) {
+    let ctx = ctx::Ctx::process();
+    let mut c = Command::new(&ctx.exe);
+    c.args(args);
+    if let Err(e) = ctx::spawn_detached(&mut c) {
+        eprintln!("frame: cannot run {}: {e}", ctx.exe.display());
     }
-}
-
-/// bin/frame: $FRAME_BIN, then `frame` next to this binary, then the repo
-/// layout (gui/target/<profile>/frame-gui -> bin/frame), then PATH.
-pub fn clip_bin() -> PathBuf {
-    if let Some(p) = std::env::var_os("FRAME_BIN").filter(|p| !p.is_empty()) {
-        return PathBuf::from(p);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for c in [dir.join("frame"), dir.join("../../../bin/frame")] {
-                if is_exec(&c) {
-                    return c.canonicalize().unwrap_or(c);
-                }
-            }
-        }
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        for d in std::env::split_paths(&path) {
-            let c = d.join("frame");
-            if is_exec(&c) {
-                return c;
-            }
-        }
-    }
-    PathBuf::from("frame")
-}
-
-fn is_exec(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    p.metadata().map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
-}
-
-/// `frame ARGS…` detached (screenshots, bind).
-pub fn clip_detached(args: &[&str]) {
-    spawn_detached(Command::new(clip_bin()).args(args));
 }
 
 #[cfg(test)]
@@ -184,7 +149,7 @@ pub mod testutil {
     pub fn tempdir(tag: &str) -> TempDir {
         static N: AtomicU32 = AtomicU32::new(0);
         let d = std::env::temp_dir().join(format!(
-            "frame-gui-test-{}-{tag}-{}",
+            "frame-test-{}-{tag}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));

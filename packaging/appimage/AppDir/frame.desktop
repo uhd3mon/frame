@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Frame
+GenericName=Screenshot Tool
+Comment=Screenshots with global shortcuts
+Exec=frame
+Icon=frame
+Terminal=false
+Categories=Utility;
+Keywords=screenshot;screen;capture;snip;
+StartupWMClass=frame

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate gui/icons/png/*.png from the SVGs, plus preview.png (untracked).
+# Regenerate icons/png/*.png from the SVGs, plus preview.png (untracked).
 # Needs rsvg-convert. The preview also needs ImageMagick (magick).
 set -euo pipefail
 cd "$(dirname "$0")"

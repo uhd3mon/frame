@@ -6,6 +6,8 @@
 *.mkv
 .env
 *.local
-!gui/icons/png/*.png
-gui/target/
+!icons/png/*.png
+/target/
+/dist/
 CLAUDE.md
+!docs/*.png

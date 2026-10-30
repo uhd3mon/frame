@@ -1,9 +1,10 @@
-//! The frame config file: same reading rules as `load_config` in bin/frame,
-//! and a writer that changes only the values it has to.
+//! The frame config file: the one reader (CLI, tray and settings window
+//! all use it), validation, and a writer that changes only the values it
+//! has to. `key = value` text; never executed.
 
 use std::collections::BTreeMap;
 
-/// Keys and defaults, in the order of `default_config()` in bin/frame.
+/// Keys and defaults, in the order of DEFAULT_TEXT.
 pub const DEFAULTS: &[(&str, &str)] = &[
     ("save_dir", "~/Documents"),
     ("image_format", "png"),
@@ -17,11 +18,39 @@ pub const DEFAULTS: &[(&str, &str)] = &[
 
 pub const ACTIONS: &[&str] = &["region", "window", "monitor", "all"];
 
+/// Removed in 0.4.0 (Frame is pictures only). Their keys are ignored in
+/// old configs without a warning, and bind / unbind still remove the
+/// shortcuts a 0.3 bound for these actions.
+pub const OLD_ACTIONS: &[&str] = &["replay", "record"];
+pub const OLD_KEYS: &[&str] = &[
+    "video_format", "replay", "replay_seconds", "video_source", "video_fps", "video_quality",
+    "video_codec", "audio", "bind.replay", "bind.record",
+];
+
+/// What `frame config` writes when there is no config yet.
+pub const DEFAULT_TEXT: &str = "\
+# frame config: key = value. # starts a comment at the start of a line or
+# after a space. Values may be quoted. Delete a line to use its default.
+# Only ~ and ~/ are expanded; $VARS are not.
+
+save_dir = ~/Documents     # screenshots go to <save_dir>/frame/images
+image_format = png         # png | jpg | webp
+clipboard = true           # copy each screenshot to the clipboard
+notify = true              # notification with a preview
+
+# Shortcuts use KDE-style names: Meta, Ctrl, Alt, Shift + one key (a-z, 0-9,
+# F1-F35, Print, Space, Home, ...). Empty = none.
+bind.region = Meta+Alt+R
+bind.window = Meta+Alt+W
+bind.monitor = Meta+Alt+M
+bind.all = Meta+Alt+A
+";
+
 pub fn is_known(key: &str) -> bool {
     DEFAULTS.iter().any(|(k, _)| *k == key)
 }
 
-/// Bash's `[[:space:]]` under `LC_ALL=C` (load_config sets it): ASCII only.
+/// Whitespace is ASCII only, whatever the locale.
 fn is_sp(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
 }
@@ -43,12 +72,11 @@ struct Assign {
     vstart: usize,
     /// End of the key = value part: where " # comment" starts, or the line end.
     cut: usize,
-    /// The value as bash sees it (trailing spaces gone, one pair of quotes off).
+    /// The value (trailing spaces gone, one pair of quotes off).
     value: Vec<u8>,
 }
 
-/// Parse a line like bash does (bytes, C locale); None for blank, comment
-/// or junk lines. Works on bytes so a file that isn't UTF-8 round-trips.
+/// Parse one line (as bytes); None for blank, comment or junk lines. Works on bytes so a file that isn't UTF-8 round-trips.
 fn parse_line(line: &[u8]) -> Option<Assign> {
     let t = trim_start(line);
     if t.is_empty() || t[0] == b'#' {
@@ -73,7 +101,7 @@ fn parse_line(line: &[u8]) -> Option<Assign> {
     Some(Assign { key, vstart, cut, value: value.to_vec() })
 }
 
-/// bash `read -r` lines: split on \n, a last line without \n still counts.
+/// Lines split on \n; a last line without \n still counts.
 fn lines(text: &[u8]) -> Vec<&[u8]> {
     let mut v: Vec<&[u8]> = text.split(|b| *b == b'\n').collect();
     if v.last().is_some_and(|l| l.is_empty()) {
@@ -99,7 +127,7 @@ pub fn parse(text: impl AsRef<[u8]>) -> BTreeMap<String, String> {
     m
 }
 
-/// Why the bash parser could not read this value back, if it couldn't.
+/// Why the parser could not read this value back, if it couldn't.
 pub fn unrepresentable(value: &str) -> Option<&'static str> {
     if value.chars().any(|c| c.is_control()) {
         return Some("contains a tab, newline or other control character");
@@ -110,7 +138,7 @@ pub fn unrepresentable(value: &str) -> Option<&'static str> {
     None
 }
 
-/// The text to write after `key = ` so bash reads back exactly `value`.
+/// The text to write after `key = ` so parse reads back exactly `value`.
 /// Quotes only when needed (edge spaces, a leading #, or a quote pair).
 pub fn format_value(value: &str) -> String {
     let b = value.as_bytes();
@@ -180,51 +208,12 @@ pub fn apply(text: &[u8], changes: &BTreeMap<String, String>) -> Result<Vec<u8>,
     Ok(out)
 }
 
-/// Same rule as `parse_shortcut` in bin/frame: modifiers plus one key.
+/// Modifiers plus exactly one known key (see keys::parse).
 pub fn valid_shortcut(s: &str) -> bool {
-    let s: String = s.chars().filter(|c| !c.is_ascii() || !is_sp(*c as u8)).collect();
-    if s.is_empty() || s.ends_with('+') {
-        return false;
-    }
-    let mut key = false;
-    for part in s.split('+') {
-        // ASCII only, like ${1,,} under LC_ALL=C (the Kelvin sign is not k).
-        match part.to_ascii_lowercase().as_str() {
-            "meta" | "super" | "win" | "ctrl" | "control" | "alt" | "shift" => {}
-            p => {
-                if key || !known_key(p) {
-                    return false;
-                }
-                key = true;
-            }
-        }
-    }
-    key
+    crate::keys::parse(s).is_some()
 }
 
-fn known_key(k: &str) -> bool {
-    const NAMED: &[&str] = &[
-        "esc", "escape", "tab", "backspace", "return", "enter", "ins", "insert", "del", "delete",
-        "pause", "print", "home", "end", "left", "up", "right", "down", "pgup", "pageup",
-        "pgdown", "pagedown", "space",
-    ];
-    if NAMED.contains(&k) {
-        return true;
-    }
-    if k.len() == 1 {
-        return k.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-    }
-    if let Some(n) = k.strip_prefix('f') {
-        if !n.starts_with('0') {
-            if let Ok(n) = n.parse::<u32>() {
-                return (1..=35).contains(&n);
-            }
-        }
-    }
-    false
-}
-
-/// Would `validate_config` in bin/frame accept V for KEY on its own?
+/// Would `validate` accept V for KEY on its own?
 /// (save_dir and shortcuts aren't checked here.)
 pub fn valid_value(key: &str, v: &str) -> bool {
     match key {
@@ -236,9 +225,67 @@ pub fn valid_value(key: &str, v: &str) -> bool {
     }
 }
 
-/// Same as bin/frame `yes_`.
 pub fn yes(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1")
+}
+
+/// Like `parse`, plus a warning for each line it skips: junk lines, and
+/// unknown keys other than the old video ones. NAME is the file name
+/// shown in the warnings.
+pub fn parse_warn(text: &[u8], name: &str) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut warnings = Vec::new();
+    for (i, l) in lines(text).into_iter().enumerate() {
+        let t = trim_start(l);
+        if t.is_empty() || t[0] == b'#' {
+            continue;
+        }
+        match parse_line(l) {
+            None => warnings.push(format!("{name}:{}: ignored (expected key = value)", i + 1)),
+            Some(a) if !is_known(&a.key) && !OLD_KEYS.contains(&a.key.as_str()) => {
+                warnings.push(format!("{name}:{}: unknown key '{}'", i + 1, a.key))
+            }
+            Some(_) => {}
+        }
+    }
+    (parse(text), warnings)
+}
+
+/// The first value that frame can't use, as the message `frame check`
+/// prints. HOME expands save_dir's ~.
+pub fn validate(vals: &BTreeMap<String, String>, home: &std::path::Path) -> Result<(), String> {
+    if !valid_value("image_format", &vals["image_format"]) {
+        return Err("image_format must be png, jpg or webp".into());
+    }
+    for k in ["clipboard", "notify"] {
+        if !valid_value(k, &vals[k]) {
+            return Err(format!("{k} must be true or false"));
+        }
+    }
+    let d = &vals["save_dir"];
+    let abs = d == "~" || d.starts_with("~/") || d.starts_with('/');
+    if !abs || (d.starts_with('~') && !home.is_absolute()) {
+        return Err(format!("save_dir must be an absolute path or start with ~/ (got '{d}')"));
+    }
+    for a in ACTIONS {
+        let k = &vals[&format!("bind.{a}")];
+        if !k.is_empty() && !valid_shortcut(k) {
+            return Err(format!("bind.{a}: '{k}' is not a shortcut (example: Meta+Alt+R)"));
+        }
+    }
+    Ok(())
+}
+
+/// Read and validate the config at PATH. A missing file means defaults;
+/// any other read error is an error. Ok = (values, warnings).
+pub fn load(path: &std::path::Path, home: &std::path::Path) -> Result<(BTreeMap<String, String>, Vec<String>), String> {
+    let text = match std::fs::read(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let (vals, warnings) = parse_warn(&text, &path.display().to_string());
+    validate(&vals, home)?;
+    Ok((vals, warnings))
 }
 
 #[cfg(test)]
@@ -255,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_like_bash() {
+    fn parse_rules() {
         let t = "# c\n  # indented\nsave_dir = \"/x/my#docs\"   # real\nbind.region = 'Meta+R'#x\n\
                  image_format=jpg#no-space\nbind.all = 'Alt+A'\nfoo.bar = 1\njunk line\n\
                  clipboard =   false  \t\nbind.window =\nbind.monitor = F9";
@@ -293,7 +340,7 @@ mod tests {
         assert_eq!(parse("save_dir = \"\n")["save_dir"], "\"");
     }
 
-    /// Only ASCII whitespace counts (bash runs load_config under LC_ALL=C):
+    /// Only ASCII whitespace counts, whatever the locale:
     /// U+3000 before # is part of the value, and no edge trimming of it.
     #[test]
     fn unicode_space_is_not_space() {
@@ -385,11 +432,11 @@ mod tests {
     }
 
     #[test]
-    fn shortcuts_match_bash() {
+    fn shortcut_rules() {
         for ok in ["Meta+Alt+R", " ctrl + shift + print ", "Meta+F35", "Alt+PgUp", "Super+5", "Space"] {
             assert!(valid_shortcut(ok), "{ok}");
         }
-        // \u{212a} is the Kelvin sign: Unicode lowercases it to k, bash under C doesn't.
+        // \u{212a} is the Kelvin sign: Unicode lowercases it to k; we only lowercase ASCII.
         for bad in ["Meta+Foo+R", "Meta+Alt+", "Meta+R+T", "Meta+Alt", "Meta+,", "Meta+F36", "Meta+é", "", "Meta+F0", "Meta+F01", "Meta+\u{212a}", "Meta+\u{3000}R"] {
             assert!(!valid_shortcut(bad), "{bad}");
         }
@@ -408,38 +455,51 @@ mod tests {
         }
     }
 
-    /// The bash parser itself agrees with the writer (skipped without bash).
-    /// Run under a UTF-8 locale: load_config must still treat only ASCII
-    /// as space. save_dir is free text; validation is off for the odd values.
     #[test]
-    fn bash_reads_what_we_write() {
-        let frame = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../bin/frame");
-        if !frame.exists() || std::process::Command::new("bash").arg("-c").arg("true").status().is_err() {
-            return;
+    fn default_text_matches_defaults() {
+        let keys: Vec<&str> = DEFAULT_TEXT.lines().filter_map(|l| parse_line(l.as_bytes()).map(|a| a.key)).map(|k| DEFAULTS.iter().find(|d| d.0 == k).unwrap().0).collect();
+        assert_eq!(keys, DEFAULTS.iter().map(|d| d.0).collect::<Vec<_>>());
+        let (m, w) = parse_warn(DEFAULT_TEXT.as_bytes(), "c");
+        assert!(w.is_empty(), "{w:?}");
+        for (k, v) in DEFAULTS {
+            assert_eq!(m[*k], *v, "{k}");
         }
-        let dir = crate::testutil::tempdir("bashrt");
-        let cfg = dir.join("config");
-        let read_back = |text: &[u8]| {
-            std::fs::write(&cfg, text).unwrap();
-            let out = std::process::Command::new("bash")
-                .arg("-c")
-                .arg(r#"source "$1"; validate_config() { :; }; load_config 2>/dev/null; printf %s "${CFG[save_dir]}""#)
-                .arg("_")
-                .arg(&frame)
-                .env("FRAME_CONFIG", &cfg)
-                .env("HOME", &*dir)
-                .env("LC_ALL", "en_US.UTF-8")
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "bash failed for {:?}", String::from_utf8_lossy(text));
-            out.stdout
+        assert!(DEFAULT_TEXT.contains("$VARS are not"));
+        for bad in ["video", "replay", "record", "audio"] {
+            assert!(!DEFAULT_TEXT.contains(bad), "{bad}");
+        }
+        assert!(validate(&m, std::path::Path::new("/home/x")).is_ok());
+    }
+
+    #[test]
+    fn warnings_and_old_keys() {
+        let t = "replay = true\nvideo_fps = 9000\ncolour = red\njunk line\n  # c\n\nimage_format = jpg\n";
+        let (m, w) = parse_warn(t.as_bytes(), "/c");
+        assert_eq!(w, ["/c:3: unknown key 'colour'", "/c:4: ignored (expected key = value)"]);
+        assert_eq!(m["image_format"], "jpg");
+    }
+
+    #[test]
+    fn validation_messages() {
+        let home = std::path::Path::new("/home/x");
+        let v = |pairs: &[(&str, &str)]| {
+            let mut m = parse("");
+            for (k, val) in pairs {
+                m.insert(k.to_string(), val.to_string());
+            }
+            validate(&m, home)
         };
-        for v in ["/my dir/a#b", " lead", "trail ", "\"q\"", "'q'", "#hash", "a\"b", "", "Дé x", "\"x", "a'b c", "a\u{3000}#b", "\u{3000}x"] {
-            let text = apply(b"save_dir = x   # c\nfoo.bar = 1\n", &ch(&[("save_dir", v)])).unwrap();
-            assert_eq!(String::from_utf8_lossy(&read_back(&text)), v, "bash read back {v:?}");
-        }
-        for line in ["save_dir = x\u{3000}#c\n", "save_dir =\u{3000}x\u{3000}\n", "save_dir = 'a b' # c\r\n"] {
-            assert_eq!(String::from_utf8_lossy(&read_back(line.as_bytes())), parse(line)["save_dir"], "{line:?}");
-        }
+        assert_eq!(v(&[("notify", "maybe")]).unwrap_err(), "notify must be true or false");
+        assert_eq!(v(&[("image_format", "gif")]).unwrap_err(), "image_format must be png, jpg or webp");
+        assert_eq!(v(&[("image_format", "jpg#x")]).unwrap_err(), "image_format must be png, jpg or webp");
+        assert!(v(&[("save_dir", "docs")]).unwrap_err().starts_with("save_dir must be an absolute path"));
+        assert!(v(&[("save_dir", "~user/x")]).is_err());
+        assert!(v(&[("save_dir", "~")]).is_ok());
+        assert_eq!(
+            v(&[("bind.region", "'Meta+Alt+R'#x")]).unwrap_err(),
+            "bind.region: ''Meta+Alt+R'#x' is not a shortcut (example: Meta+Alt+R)"
+        );
+        assert!(v(&[("bind.window", "")]).is_ok());
+        assert!(v(&[("bind.all", "Meta+$(touch x)")]).is_err());
     }
 }

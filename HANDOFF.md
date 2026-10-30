@@ -2,12 +2,379 @@
 
 ## Goal
 
-Screenshot tool driven by global shortcuts, one config file; `bin/frame`
-is the engine, `frame-gui` (Rust) the tray + settings window. Saves to
+Screenshot tool driven by global shortcuts, one config file. Since 0.5.0
+it is one Rust binary, `frame`: the CLI, tray and settings window (Kevin,
+2026-10-29: everything in Rust, an AppImage later). Saves to
 `<save_dir>/frame/images`, copies to the clipboard, works on KDE, GNOME,
 Hyprland, Sway and X11. MIT, all our own code (no Hyprshot code).
-Pictures only since 0.4.0 (Kevin, 2026-10-29). Sections below the 0.4.0
-one are history and use old names (clip, clipped) and video features.
+Pictures only since 0.4.0 (Kevin, 2026-10-29). Since the "built in"
+round (2026-10-29) nothing else needs installing: no grim, slurp,
+ffmpeg, wl-copy, xclip, maim or gnome-screenshot. Sections below the 0.5.0
+one are history and use old names (clip, clipped, bin/frame as Bash,
+frame-gui) and video features.
+
+## 0.5.0 committed, pushed and released (2026-10-29 ~21:20, Sora)
+
+- Kevin repointed the Workspace "frame" project to ~/Workspace/frame.
+  The old ~/Workspace/clip folder was deleted (only an old HANDOFF copy,
+  scratch tmp/, spare gray shots); its two uploads were copied into
+  uploads/ first (image-2.png, image-from-clip.png).
+- Kevin OK'd commit + push of 0.5.0 and an AppImage GitHub release.
+  The AppImage was rebuilt from the committed tree first (the 20:51 one
+  predated the flock fix and palette tweaks).
+- Observed before commit: cargo test 103 passed, clippy no warnings,
+  smoke "8 checks, all passed"; build.sh -> dist/Frame-x86_64.AppImage
+  4.1M, sha256 0990314c...; it prints `frame 0.5.0` in a temp HOME.
+- Kevin asked to update the GitHub README "and all of that": README got
+  a feature list, a Download section (latest release link) and the
+  settings screenshot (docs/settings.png, tracked via `!docs/*.png`);
+  the repo description no longer mentions replay/recording, topics set.
+- Release: tag v0.5.0, asset Frame-x86_64.AppImage. Commits carry no AI
+  trailers (Kevin's rule beats the tool's default attribution).
+- Next: Kevin tries a real region drag and a shortcut on KDE with 0.5;
+  GNOME / Hyprland / real X11 still untested on real desktops.
+
+## Sora's check + real install of 0.5.0 built-in + gray theme (2026-10-29 ~21:12, committed in 0.5.0)
+
+- Kevin asked: everything bundled (no GNOME/Hyprland/Sway/ffmpeg helpers)
+  and a neutral dark gray settings window. Atlas = built-in backends,
+  Strata = gray palette (src/theme.rs, design/gui.md; Atlas later set
+  TEXT_FAINT #929292, BORDER #444444), Nova reviewed (0 High, 4 Medium,
+  7 Low, all fixed). Shots: shots/frame-settings-gray.png,
+  frame-shortcut-editor-gray.png, frame-settings-install-gray.png,
+  frame-settings-contrast.png (latest palette).
+- Observed: cargo test 103 passed x5 in a row, clippy 0 warnings,
+  smoke 8 passed. ./install.sh replaced 0.4 in ~/.local (old frame-gui
+  and autostart/frame-gui.desktop removed), tray restarted as
+  `frame tray`, `frame --version` = 0.5.0. Real KDE shots with the
+  installed binary (temp config, clipboard/notify off): monitor JPG
+  2560x1440 and all JPG 2560x2880, encoded in-process (no ffmpeg).
+  KDE binds frame_{region,window,monitor,all}_desktop all isActive=true.
+- Not tested: real region drag on KDE, real shortcut press with 0.5,
+  GNOME, Hyprland, real X11 WM. Not committed or pushed (Kevin's rule:
+  no AI trailers). Next: Kevin tries region + a shortcut, then commit +
+  push 0.5.0 and maybe publish the AppImage as a GitHub release (ask).
+- (Fixed later the same day: Kevin repointed the Workspace project to
+  ~/Workspace/frame and clip/ was deleted.) Keep all project files in
+  ~/Workspace/frame.
+
+## Flaky shot.lock test fixed (2026-10-29, Atlas, uncommitted for Sora's review)
+
+- Symptom: full `cargo test` failed about 1 run in 3 or 4
+  (`second_shot_while_busy` could hit it too)
+  (`real_mode_without_display`, once `other_desktops`): `frame all`
+  exited 0 silently = Stop::Busy.
+- Cause: a flock belongs to the open file, not the fd. Every spawn in
+  the test process (any thread) copies the whole fd table into the child
+  until it execs (CLOEXEC). If a test's `shot.lock` File closed in that
+  window, the child's copy kept the lock, and the next shot in the same
+  test saw Busy. Probe evidence: at Busy, no other process had the file
+  open, and the lock freed itself about 250 µs later.
+- Fix: `ctx::Flock` guard. It calls unlock (LOCK_UN, which releases the
+  lock for every copy) before the File closes. `shot_lock`, `bind_lock`
+  and the busy test use it. The assert in `real_mode_without_display`
+  now prints desk, out and err.
+- Lesson: never rely on close to release a flock in a process that
+  spawns children; unlock explicitly.
+- Checks: cargo test 30 runs in a row, 103 passed every time (it failed
+  4 of 14 runs before the fix); clippy --all-targets 0 warnings;
+  smoke 8 passed.
+
+## Nova's review of the built-in round, fixes (2026-10-29, Atlas, uncommitted for Sora's review)
+
+- One shot at a time: `shot::shot` try-locks `$RUNDIR/shot.lock` until
+  the picture is taken (selection included). Held = `Stop::Busy`: exit 0,
+  no toast, no output. Before, a second shortcut captured the dim overlay.
+- Selector (select.rs): fails if no surface is configured within 5 s
+  ("showing the selector"), then waits as before. Fullscreen-toplevel
+  path (GNOME) asks for focus via xdg-activation: it uses
+  XDG_ACTIVATION_TOKEN from our launcher if set, else asks for its own.
+  This is best effort; right-click always cancels. A configure with a new
+  size (layer or toplevel) destroys the old wl_buffer and rebuilds the
+  backdrop.
+- Memory: `select` takes the capture parts (`&[Shot]`), with no stitched
+  copy. `Backdrop` is a view into the part at an offset (a scaled copy
+  only when the densities differ). No `bright`/`dim` buffers: rows are
+  computed per paint and written straight into the memfd, 64 rows per
+  write. `crop_parts`/`stitch` borrow (`Shot::join` passes a single part
+  through).
+- Opaque output: captures read A formats as X (`Fmt::opaque`), `pick`
+  prefers X formats, and stitch gaps between uneven monitors are opaque
+  black, so `all` PNGs are RGB.
+- Lows: the X11 INCR chunk is at most `maximum_request_bytes()-32`.
+  `frame _clip` writes "ok"/"error" without panicking on a closed pipe.
+  When the portal times out, its Request is closed, and a late picture is
+  removed if it still arrives while we run. ext-image-copy-capture is
+  bound only when it is used. One cached wl_shm per connection
+  (`Wl::shm()`).
+- Theme: TEXT_FAINT #929292 (4.61:1 on CARD; #8E8E8E would be 4.38).
+  BORDER #444444 (was #3A3A3A, almost the same as CONTROL #383838).
+  design/gui.md table updated.
+
+Observed: `cargo test` 103 passed (new: second_shot_while_busy,
+backdrop_view_offset), `cargo clippy --all-targets` no warnings, `bash
+tests/smoke.sh` 8 checks passed, AppImage rebuilt (4,266,488 bytes,
+`frame 0.5.0`, `all` from it in headless sway = 2240x1200 RGB). Private
+headless Sway (800x600@1 + 640x480@2): `all` RGB on both ext and wlr
+(was RGBA). Region drag/cross-monitor/click/Esc/right-click on
+layer-shell and FRAME_SELECT=xdg passed 3/3 each (30/30). A `frame all`
+while the selector was open returned 0 with empty stdout and stderr, and
+saved nothing. On the xdg path WAYLAND_DEBUG shows
+get_activation_token -> done -> activate. Selector VmHWM 54 MB (debug
+build; no earlier figure to compare). Not run: real GNOME, the 5 s
+configure timeout (no compositor that withholds configure).
+Harness lesson: the headless seat only gains a pointer/keyboard when
+vinput connects, so the first event can arrive before Frame has a
+wl_pointer (we saw a lost press, and Esc arriving as keycode 22). Put
+`sleep:300` after vinput's first motion.
+
+## Everything built in: no helper programs (2026-10-29, Atlas, uncommitted for Sora's review)
+
+Kevin: users must not have to install anything else. All capture,
+selection, encoding and clipboard helpers are now our own Rust code in
+`frame` (and so in the AppImage).
+
+- New modules: `pixels.rs` (Rect/Shot, raw->RGBA incl. 10-bit formats,
+  output transforms, multi-monitor stitch at the densest scale, logical
+  crop, png/jpg q90/lossless webp via `image`), `wl.rs` (outputs via
+  xdg-output, memfd wl_shm buffers with pread/pwrite, ext-image-copy-capture
+  preferred, wlr-screencopy fallback), `select.rs` (area selector), `ipc.rs`
+  (Hyprland/Sway sockets instead of hyprctl/swaymsg for window/monitor),
+  `portal.rs` (Screenshot, OpenFile/OpenDirectory, Mutter primary monitor),
+  `x11.rs` (GetImage, RandR, _NET_ACTIVE_WINDOW + _NET_FRAME_EXTENTS -
+  _GTK_FRAME_EXTENTS, selector window, CLIPBOARD owner with INCR).
+- Backends: KDE Wayland = KWin ScreenShot2 (unchanged); Hyprland/Sway/other
+  Wayland = screencopy (a Wayland desktop without it falls back to the
+  portal); GNOME Wayland = portal (monitor = primary monitor, window =
+  GNOME's interactive picker); any X11 = x11rb (KDE X11 no longer uses
+  Spectacle). `--detect` names: capture kwin|screencopy|portal|x11,
+  clipboard data-control|focus|x11.
+- Decision (deviates from "dim over live"): region captures first and the
+  selector shows the frozen picture dimmed #00000055, inside undimmed,
+  2 px white border (0xcc). WYSIWYG, and the overlay or KWin's close
+  animation can never end up in the shot. A click without a drag takes the
+  monitor under the pointer; Esc / right-click cancel. A region is cut at
+  the density of the monitors it touches (`pixels::crop_parts`).
+- Clipboard: `frame _clip FILE MIME data-control|focus|x11`. GNOME = "focus":
+  a 1x1 transparent xdg-toplevel takes keyboard focus, set_selection with
+  the enter serial, window destroyed, process keeps serving (wl-copy's
+  method); if no focus within 2 s and DISPLAY is set, X11 via Xwayland.
+  data-control refused + DISPLAY set -> X11 as well.
+- Toast buttons: portal OpenFile/OpenDirectory; xdg-open only if the portal
+  (and FileManager1 for the folder) fail.
+- Still run, by design: hyprctl / swaymsg / gsettings for binds (shipped
+  by those desktops), and optional update-desktop-database /
+  gtk-update-icon-cache in install.
+- Deps: wayland-protocols =0.32.13 (client, staging, unstable), x11rb
+  =0.13.2 (randr), image =0.25.10 (png, jpeg, webp). Only new package in
+  Cargo.lock: image-webp 0.2.4. settings.rs and theme.rs untouched.
+- Test switches: FRAME_SCREENCOPY=wlr, FRAME_SELECT=xdg, FRAME_DEBUG=1.
+- Bug found and fixed on the way: `Wl::wait` must flush after dispatching
+  (get_pointer from the seat handler otherwise sat unsent).
+
+Observed (Atlas, 2026-10-29):
+- `cargo test` 101 passed (4 runs), `cargo clippy --all-targets` 0
+  warnings, `bash tests/smoke.sh` 8 checks all passed (new: every
+  desktop/session dry-runs region/window/monitor/all with an empty PATH
+  and plans no outside tool), `cargo build --release` 7,632,944 bytes.
+- Private headless Sway 1.12, 2 outputs (800x600 @1, 640x480 @2): `all`
+  = 2240x1200 stitched (gap transparent); `monitor` under all 7 non-normal
+  transforms upright (bar on top), ext and wlr paths give identical
+  pixels; `window` = focused container via IPC (800x548); region with a
+  virtual pointer/keyboard: drag 200x150 @1x, cross-monitor 400x200 @2x,
+  click = whole monitor (640x480 / 800x600), Esc and right-click cancel;
+  same with FRAME_SELECT=xdg (fullscreen toplevels); mid-drag screenshot
+  shows dim + undimmed selection + border. Clipboard: data-control and the
+  GNOME "focus" method both read back byte-identical with wl-paste; the
+  focus helper exits when something else is copied.
+- Xvfb :77 + x11rb test client: all 1280x800, window 400x300 (from
+  _NET_ACTIVE_WINDOW), monitor, region drag 200x100, Esc/right-click
+  cancel, click = monitor; clipboard TARGETS = TARGETS TIMESTAMP image/png;
+  16 KB direct and 3 MB INCR transfers byte-identical.
+- Kevin's live KDE (KWin 6.8.2, 2x 2560x1440), debug binary, into tmp/,
+  clipboard and notifications off: KWin path all 2560x2880, monitor and
+  window 2560x1440. KWin offers neither screencopy protocol, so without
+  XDG_CURRENT_DESKTOP the generic path fell back to the portal
+  (xdg-desktop-portal-kde) and that worked too (all + monitor); the
+  portal's temp file was removed, nothing left in ~/Pictures.
+- Nested `kwin_wayland --virtual` in dbus-run-session: the layer-shell
+  overlay appears (whole screen dimmed in a ScreenShot2 grab) and is gone
+  after frame exits. No input injection there.
+- AppImage: build.sh ok, 4,262,392 bytes (4.1 MB), sha256 3c4a85a2…87cd80.
+  The binary NEEDs only libgcc_s, libm, libc (GLIBC_2.35 max), 0 bundled
+  .so. Runs in stock ubuntu:22.04 (version + dry runs for x11/KDE/GNOME);
+  real `all` as jpg in the private Sway plus wl-paste match.
+
+Not tested: GNOME itself (no Mutter here): portal on GNOME, the
+permission prompt, Mutter DisplayConfig primary, the fullscreen selector
+and the focus clipboard on Mutter (focus method verified on Sway only);
+Hyprland (IPC parsing unit-tested with JSON, socket path not run);
+selector input on KWin (overlay shown only); KDE X11; a real X11 window
+manager (frame extents unit-tested); 10-bit capture formats (unit only).
+Nothing installed into ~/.local, nothing committed.
+
+Next: Sora's review / Nova; a GNOME VM or live session check (first-run
+permission prompt, focus clipboard under focus-stealing prevention);
+a real region on Kevin's KDE (needs his mouse).
+
+## frame install + Nova's 0.5 review fixes (2026-10-29, Atlas, uncommitted for Sora's review)
+
+- `frame install [--force] [--no-autostart] [--from FILE]` / `frame
+  uninstall` in Rust (`src/install.rs`), a port of install.sh: copies
+  the running binary (from the AppImage: the binary in its mount; it
+  needs no bundled libs) to `$PREFIX/bin/frame` by temp+rename, embedded
+  icons, `frame.desktop`, manifest; PREFIX/DESTDIR from env as before.
+  Live installs keep the old clean-ups (Clipped, 0.3 service + video
+  .desktop entries + pid-file processes, 0.4 frame-gui + its autostart).
+  New: a login entry that runs the AppImage is pointed at the installed
+  frame; the tray is restarted without FRAME_BIN/APPIMAGE/APPDIR.
+- Decision: **install.sh is now a thin wrapper** (`cargo build --release`
+  unless --no-build, then `target/release/frame install|uninstall`), so
+  the logic lives in one place. The behaviour tests moved from smoke.sh
+  into `cargo test` (11 install tests: DESTDIR, autostart, foreign bin,
+  process stopping, AppImage tray/autostart move, 0.4/0.3 upgrades,
+  Clipped). smoke.sh = 7 checks: wrapper arg/env passthrough, build
+  path, uninstall path, refusals, plus one real-binary install/uninstall
+  in a temp HOME with `env -i`, no D-Bus, no display, desktop frame-test.
+- Stopping (Nova P3.1): only the tray and settings: processes whose
+  /proc exe is our bin/frame (or "(deleted)") with argv[1] none, `tray`
+  or `settings`, plus the live `tray.pid` process (the AppImage's tray).
+  `_clip`, `_toast` and captures are never stopped. Zombies count as gone.
+- Settings: "Frame isn't installed yet" + **Install Frame** (theme::notice,
+  primary button) when `APPIMAGE` is set and nothing is installed under
+  the default PREFIX. Install runs in-process on a thread; on success the
+  window sets FRAME_BIN to the installed path so later Saves bind to it.
+  Shot: `shots/frame-settings-install.png` (the real AppImage window).
+- Autostart bug fixed: `write_autostart` uses `install::stable_exe`
+  (installed frame if any, else $APPIMAGE, else this binary; error if
+  inside $APPDIR).
+- Nova P1: every `frame-<action>.desktop` now has
+  `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2`; comments
+  in AGENTS.md, grab.rs, install.rs say KWin 6.8 no longer enforces it,
+  key kept for <= 6.7. grab's NoAuthorized message now says "run `frame install`".
+- P3.2: `frame _clip` answers each paste on its own thread with a
+  non-blocking write + poll, 10 s cap (`wlclip::send_all`).
+- P3.3: `Ctx::session_bus()` (DBUS_SESSION_BUS_ADDRESS, else
+  $XDG_RUNTIME_DIR/bus, from the Ctx env) for binds, notify (3 places)
+  and grab. testenv has no address and a temp runtime dir.
+- P3.4: KDE with no bus / no kglobalaccel: `Kga::new` pings it; every
+  kglobalaccel call error propagates as "can't reach kglobalaccel (KDE's
+  shortcut service) over D-Bus: …", exit 1, no state saved.
+- P3.5: unknown command's usage goes through `ctx.err_raw`.
+
+Observed: `cargo test` 87 passed (20/20 repeat runs), `cargo clippy
+--all-targets` no warnings, `bash tests/smoke.sh` 7 checks all passed,
+`cargo build --release` ok (7.0 MB). `packaging/appimage/build.sh` ok:
+dist/Frame-x86_64.AppImage 3.9 MB, sha256 c5eef331…55d8c7. With the
+AppImage under `env -i` + temp HOME: `--version` = frame 0.5.0; `install`
+wrote 11 files + manifest + autostart (Exec = temp ~/.local/bin/frame),
+the installed binary is an ELF that prints frame 0.5.0; reinstall rc 0;
+`uninstall` removed all of it (mimeinfo.cache left, as before).
+
+Not done / not verified: no install into the real ~/.local (as asked);
+the Install button was not clicked in a live session; KWin <= 6.7
+authorization of the installed copy is untested (Kevin has 6.8.2);
+the new `_clip` writer is unit-tested with pipes only, not against a
+compositor this round. Nothing committed.
+
+## AppImage, phase 2 (2026-10-29, Atlas, uncommitted for Sora's review)
+
+`packaging/appimage/` (build.sh, Dockerfile, versions.env, AppDir/AppRun +
+frame.desktop, README.md = all research and evidence) builds the ignored
+`dist/Frame-x86_64.AppImage` (3.8 MB). frame is built in Docker on Ubuntu
+22.04, so it needs glibc 2.35, not the host's 2.43. appimagetool 1.9.1 and the
+static type2 runtime 20251108 are pinned by sha256. No libraries are
+bundled (only libc/libm/libgcc_s are linked, the rest is dlopen). AppRun sets
+`FRAME_BIN=$APPIMAGE` so binds name the .AppImage, not `/tmp/.mount_*`.
+src/ and install.sh were not touched (Nova was reviewing them).
+
+Findings: KWin 6.8.2 doesn't check ScreenShot2 callers. KWin ≤6.7 matches
+`/proc/pid/exe` to a .desktop Exec, which an AppImage can never satisfy.
+Recommended next step: "Install Frame" from the AppImage, i.e. `frame install`
+in Rust, which copies to ~/.local/bin and writes the desktop entries.
+Known bug for the AppImage: settings.rs `write_autostart` uses
+`current_exe()` (the mount path) instead of FRAME_BIN.
+
+Observed: build.sh exit 0. `--version` = `frame 0.5.0`. `--detect` with
+FRAME_DRY_RUN and temp XDG dirs prints backends (kde/kwin/data-control when
+KDE env is set). Dry-run `bind` prints the AppImage path. The AppImage ran via
+`--appimage-extract-and-run` in stock ubuntu:22.04, 24.04 and 26.04
+containers. desktop-file-validate is clean.
+
+## Frame 0.5.0: one Rust binary (2026-10-29, Atlas, uncommitted for Sora's review)
+
+Phase 1 of "everything in Rust": the 805-line Bash `bin/frame` is gone,
+ported into the crate, and the crate moved from `gui/` to the repo root
+and renamed `frame-gui` -> `frame` (version 0.5.0, binary `frame`).
+
+- CLI unchanged: region/window/monitor/all, bind, unbind, check [FILE],
+  config, status, --detect, --help, --version; `monitors` stays removed
+  (0.4). GUI: `frame` (no args) = tray if not running + settings (old
+  `frame-gui --open`, the start-menu entry), `frame tray` (old
+  `frame-gui`; autostart), `frame settings`, `frame --grab ...` (debug).
+  Internal: `frame _toast FILE TITLE COPIED`, `frame _clip FILE MIME`.
+  gui.lock / settings.lock / bind.lock flocks kept.
+- Modules: ctx (env/paths/dry-run/quoting; `Ctx` instead of process env
+  so tests run in parallel), cli, config (now the only reader:
+  `parse_warn`, `validate`, `load`, `DEFAULT_TEXT`, `OLD_KEYS`,
+  `OLD_ACTIONS`), detect, shot, grab (KWin, called in-process), wlclip,
+  notify, binds, keys.
+- Replaced helpers: notifications = zbus to org.freedesktop.Notifications
+  (x-kde-urls on KDE, image-path elsewhere; Open / Show in folder via
+  ActionInvoked, FileManager1.ShowItems, 30 min cap, in a detached
+  `frame _toast`). Clipboard on Wayland = our own wlr data-control client
+  (`frame _clip`, detached; parent waits up to 3 s for "ok"; falls back
+  to wl-copy if the compositor has no data-control). GNOME (no
+  data-control in Mutter) uses wl-copy; X11 keeps xclip (arboard would
+  also need its own serving process and the `image` crate). KDE binds =
+  kglobalaccel over zbus (flags 6 + retry quirk kept). jq is gone
+  (serde_json); gdbus is gone.
+- Still external (later phases): slurp (region), grim (Hyprland/Sway),
+  gnome-screenshot, spectacle (KDE X11), maim/import/xdotool, ffmpeg for
+  jpg/webp, hyprctl/swaymsg/gsettings for binds, xdg-open.
+- Settings window: check and bind now run in-process
+  (`cli::check_file`, `binds::bind` on a thread with captured warnings);
+  the template is `config::DEFAULT_TEXT`. Autostart file is now
+  `~/.config/autostart/frame.desktop` with `Exec=<frame> tray`.
+- install.sh: installs `target/release/frame` as `bin/frame` (11 files +
+  manifest). Upgrading 0.4: stops `frame-gui` (and a running `frame`),
+  removes `bin/frame-gui` when the old manifest lists it, replaces our
+  `autostart/frame-gui.desktop` with `autostart/frame.desktop` (not if
+  it was turned off). 0.3 and Clipped clean-up unchanged.
+- Tests: smoke.sh's engine checks moved into cargo tests (ctx, keys,
+  config, detect, shot, notify, binds, cli). smoke.sh is install-only
+  with a logging stand-in frame. Dropped as obsolete: "frame-gui next to
+  frame", "kde without frame-gui -> spectacle", the bash/Rust parser
+  parity test.
+- Deps added: serde_json 1 (resolved 1.0.x, new), wayland-client
+  =0.31.15 and wayland-protocols-wlr =0.3.12 (features client), both
+  already in Cargo.lock via winit.
+
+Checks run (Atlas, 2026-10-29):
+- `cargo test`: "test result: ok. 75 passed; 0 failed" (5 runs in a row).
+- `cargo clippy --all-targets`: no warnings.
+- `cargo build --release`: 27.5 s, binary 6,883,784 bytes.
+- `bash tests/smoke.sh`: "12 checks, all passed".
+- Private headless sway (own XDG_RUNTIME_DIR, temp XDG dirs, notify off,
+  real mode): `frame all` saved an 800x600 PNG and `wl-paste -t
+  image/png` returned the same bytes (cmp ok); after `wl-copy hi` the
+  `frame _clip` process had exited; monitor/window/webp/jpg saved;
+  `frame bind`, `status` (shortcuts: region window monitor all),
+  `unbind` returned 0 and left an empty binds state.
+- Read-only `busctl introspect` on Kevin's session: kglobalaccel
+  doRegister(as), setShortcut(asaiu)->ai, unregister(ss)->b,
+  isGlobalShortcutAvailable(is)->b, Component.isActive()->b and
+  Notify(susssasa{sv}i)->u match what the code sends.
+- `FRAME_GUI_SHOT=... frame settings` (temp dirs) saved a 480x700 frame
+  of the v2 window.
+
+Not tested (needs Kevin's session or an install): KWin grab from the
+installed binary, real KDE binds over zbus, real notifications and
+their buttons, X11 paths, GNOME. Not installed, not committed.
+
+Next: Sora's check, then a real install on Kevin's KDE (`./install.sh`
+upgrades 0.4 in place); then phase 2 (Rust region overlay instead of
+slurp, image encoders instead of ffmpeg, AppImage).
 
 ## Frame 0.4.0: pictures only (2026-10-29, uncommitted)
 
@@ -94,10 +461,9 @@ window (settings.rs, theme.rs) in parallel.
 - Public repo https://github.com/uhd3mon/frame (MIT, detected by
   GitHub), branch `main`, remote `origin`. The gh login is `uhd3mon`
   (LICENSE copyright says KevinEightSeven).
-- Kevin's rule: no Claude contributors or commit references. History was
-  rewritten before the first push to drop every `Co-Authored-By: Claude`
-  trailer (all commits were affected; hashes changed, e.g. 9fc9a92 ->
-  ba1c9d9). Never add AI co-author trailers to commits or PRs here.
+- Kevin's rule: no AI contributors or co-author trailers in commits or
+  PRs. History was rewritten before the first push to drop them (all
+  commits were affected; hashes changed, e.g. 9fc9a92 -> ba1c9d9).
 - CLAUDE.md is gitignored and removed from history; it stays locally
   (content `@AGENTS.md`) for Workspace. Pre-rewrite backup bundle was
   in the scratch tmp/ only.

@@ -1,0 +1,10 @@
+#!/bin/sh
+# AppImage entry point. The bundled frame lives in a temporary mount
+# (/tmp/.mount_*) that is gone when it exits, so shortcuts and child
+# processes must run the .AppImage file itself: FRAME_BIN tells frame that.
+HERE=$(dirname "$(readlink -f "$0")")
+if [ -n "${APPIMAGE:-}" ] && [ -z "${FRAME_BIN:-}" ]; then
+    FRAME_BIN=$APPIMAGE
+    export FRAME_BIN
+fi
+exec "$HERE/usr/bin/frame" "$@"

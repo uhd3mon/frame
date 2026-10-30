@@ -1,14 +1,18 @@
-//! `frame-gui --grab MODE [X Y W H] OUT.png`: a screenshot through KWin's
-//! own org.kde.KWin.ScreenShot2 D-Bus API, so KDE needs no Spectacle.
+//! KDE Wayland screenshots through KWin's own org.kde.KWin.ScreenShot2
+//! D-Bus API, so KDE needs no Spectacle. `frame region|window|...` calls
+//! `capture` directly; `frame --grab MODE [X Y W H] OUT.png` is the same
+//! for debugging.
 //!
-//! KWin only answers callers whose /proc/PID/exe is the Exec of a .desktop
-//! file with `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2`
-//! (install.sh writes that into frame.desktop). That is why this lives in
-//! the compiled binary and not in bin/frame: authorizing a shell tool
-//! (gdbus, python) would let any script take screenshots.
+//! KWin <= 6.7 only answers callers whose /proc/PID/exe is the Exec of a
+//! .desktop file with `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2`
+//! (`frame install` writes that into frame.desktop and every
+//! frame-<action>.desktop; KWin reads only the first entry that matches).
+//! KWin 6.8 no longer checks this allow-list; the key stays for <= 6.7.
+//! Never authorize a shell tool (gdbus, python) that way: any script
+//! could take screenshots.
 //!
 //! KWin writes raw pixels into a pipe we pass; the reply says how to read
-//! them (width, height, stride, QImage format). We turn that into RGBA PNG.
+//! them (width, height, stride, QImage format). We turn that into RGBA.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -17,28 +21,42 @@ use std::path::Path;
 
 use zbus::zvariant::{Fd, OwnedValue, Value};
 
+use crate::ctx::Ctx;
+
 const NOT_AUTHORIZED: &str = "org.kde.KWin.ScreenShot2.Error.NoAuthorized";
 
 pub fn main(args: &[String]) -> i32 {
     let (call, out) = match parse_args(args) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("frame-gui: {e}");
-            eprintln!("usage: frame-gui --grab all|monitor|window|area X Y W H OUT.png");
+            eprintln!("frame: {e}");
+            eprintln!("usage: frame --grab all|monitor|window|area X Y W H OUT.png");
             return 2;
         }
     };
-    match grab(&call).and_then(|img| write_png(&img, Path::new(&out))) {
+    match capture(&Ctx::process(), &call, Path::new(&out)) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("frame-gui: {e}");
+            eprintln!("frame: {e}");
             1
         }
     }
 }
 
+/// Take the screenshot and write it to OUT as PNG.
+pub fn capture(ctx: &Ctx, call: &Call, out: &Path) -> Result<(), String> {
+    image(ctx, call).and_then(|img| crate::pixels::save(&img, "png", out))
+}
+
+/// Take the screenshot as RGBA.
+pub fn image(ctx: &Ctx, call: &Call) -> Result<image::RgbaImage, String> {
+    let raw = grab(ctx, call)?;
+    let (px, _) = to_rgba(&raw)?;
+    image::RgbaImage::from_raw(raw.width, raw.height, px).ok_or_else(|| "KWin sent a bad image size".into())
+}
+
 #[derive(Debug, PartialEq)]
-enum Call {
+pub enum Call {
     Workspace,
     Screen,
     Window,
@@ -76,8 +94,8 @@ struct Raw {
     data: Vec<u8>,
 }
 
-fn grab(call: &Call) -> Result<Raw, String> {
-    let conn = zbus::blocking::Connection::session().map_err(|e| format!("D-Bus session: {e}"))?;
+fn grab(ctx: &Ctx, call: &Call) -> Result<Raw, String> {
+    let conn = ctx.session_bus()?;
     let proxy = zbus::blocking::Proxy::new(&conn, "org.kde.KWin", "/org/kde/KWin/ScreenShot2", "org.kde.KWin.ScreenShot2")
         .map_err(|e| format!("KWin ScreenShot2: {e}"))?;
     let mut opts: HashMap<&str, Value> = HashMap::new();
@@ -126,7 +144,7 @@ fn grab(call: &Call) -> Result<Raw, String> {
 fn describe(e: zbus::Error) -> String {
     match &e {
         zbus::Error::MethodError(name, _, _) if name.as_str() == NOT_AUTHORIZED => {
-            "not authorized: is frame.desktop installed with an absolute Exec and X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2?".into()
+            "KWin did not authorize this frame: run `frame install` (KWin 6.7 and older only let the installed frame named in frame.desktop take screenshots)".into()
         }
         zbus::Error::MethodError(name, msg, _) if name.as_str() == "org.freedesktop.DBus.Error.ServiceUnknown" => {
             format!("KWin is not running ({})", msg.as_deref().unwrap_or("no org.kde.KWin"))
@@ -196,33 +214,6 @@ fn unpremultiply([r, g, b, a]: [u8; 4]) -> [u8; 4] {
     }
 }
 
-/// Write OUT via a temp file beside it, so a failed grab leaves nothing.
-/// Opaque shots (the usual case) are stored as RGB: a quarter smaller.
-fn write_png(raw: &Raw, out: &Path) -> Result<(), String> {
-    let (rgba, opaque) = to_rgba(raw)?;
-    let tmp = out.with_file_name(format!(".{}.part", out.file_name().and_then(|n| n.to_str()).unwrap_or("grab")));
-    let r = (|| -> Result<(), String> {
-        let f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        let mut enc = png::Encoder::new(std::io::BufWriter::new(f), raw.width, raw.height);
-        enc.set_depth(png::BitDepth::Eight);
-        let data = if opaque {
-            enc.set_color(png::ColorType::Rgb);
-            rgba.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect()
-        } else {
-            enc.set_color(png::ColorType::Rgba);
-            rgba
-        };
-        let mut w = enc.write_header().map_err(|e| e.to_string())?;
-        w.write_image_data(&data).map_err(|e| e.to_string())?;
-        w.finish().map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, out).map_err(|e| e.to_string())
-    })();
-    if r.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    r.map_err(|e| format!("{}: {e}", out.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,34 +280,5 @@ mod tests {
         assert!(to_rgba(&short).unwrap_err().contains("expected 16"));
         let narrow = Raw { width: 2, height: 1, stride: 4, format: ARGB32, data: vec![0; 8] };
         assert!(to_rgba(&narrow).unwrap_err().contains("bad stride"));
-    }
-
-    #[test]
-    fn png_round_trip() {
-        let d = crate::testutil::tempdir("grab");
-        let out = d.join("shot.png");
-        for (format, px, want) in [
-            (RGB32, le(0x0011_2233), png::ColorType::Rgb),
-            (ARGB32_PREMUL, le(0x8040_2000), png::ColorType::Rgba),
-        ] {
-            let mut data = Vec::new();
-            for _ in 0..6 {
-                data.extend(px);
-            }
-            let raw = Raw { width: 3, height: 2, stride: 12, format, data };
-            write_png(&raw, &out).unwrap();
-            let mut r = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&out).unwrap())).read_info().unwrap();
-            let mut buf = vec![0; r.output_buffer_size().unwrap()];
-            let info = r.next_frame(&mut buf).unwrap();
-            assert_eq!((info.width, info.height, info.color_type), (3, 2, want));
-            let first = &buf[..if want == png::ColorType::Rgb { 3 } else { 4 }];
-            let expect = &to_rgba(&raw).unwrap().0[..first.len()];
-            assert_eq!(first, expect);
-        }
-        let names: Vec<_> = std::fs::read_dir(&*d).unwrap().map(|e| e.unwrap().file_name()).collect();
-        assert_eq!(names, ["shot.png"], "no .part left behind");
-        let bad = Raw { width: 1, height: 1, stride: 4, format: 99, data: vec![0; 4] };
-        assert!(write_png(&bad, &d.join("x.png")).is_err());
-        assert!(!d.join("x.png").exists());
     }
 }

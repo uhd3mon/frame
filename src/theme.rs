@@ -1,4 +1,4 @@
-//! Frame's look: a dark theme with a blue accent (matches the app icon),
+//! Frame's look: a neutral dark grey theme with a blue accent (matches the app icon),
 //! plus a few widgets the settings window is built from. Colours are
 //! listed in design/gui.md; keep the two in step.
 
@@ -8,20 +8,24 @@ use eframe::egui::{
     WidgetInfo, WidgetType,
 };
 
-// Surfaces, darkest to lightest.
-pub const BG: Color32 = Color32::from_rgb(0x15, 0x17, 0x1c); // window background
-pub const FIELD: Color32 = Color32::from_rgb(0x11, 0x13, 0x17); // text edits, sunken
-pub const CARD: Color32 = Color32::from_rgb(0x1d, 0x20, 0x27); // cards, bottom bar
-pub const CONTROL: Color32 = Color32::from_rgb(0x27, 0x2b, 0x34); // buttons, combos
-pub const CONTROL_HOVER: Color32 = Color32::from_rgb(0x30, 0x35, 0x40);
-pub const CONTROL_ACTIVE: Color32 = Color32::from_rgb(0x38, 0x3e, 0x4a);
-pub const BORDER: Color32 = Color32::from_rgb(0x2b, 0x2f, 0x38);
-pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x3a, 0x40, 0x4c);
+// Surfaces, darkest to lightest. Neutral greys (no blue tint); blue is
+// kept for meaning only: toggles on, Save, focus, text cursor, glyphs.
+pub const BG: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x1e); // window background
+pub const FIELD: Color32 = Color32::from_rgb(0x18, 0x18, 0x18); // text edits, sunken
+pub const CARD: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x2a); // cards, bottom bar
+pub const CONTROL: Color32 = Color32::from_rgb(0x38, 0x38, 0x38); // buttons, combos
+pub const CONTROL_HOVER: Color32 = Color32::from_rgb(0x42, 0x42, 0x42);
+pub const CONTROL_ACTIVE: Color32 = Color32::from_rgb(0x4c, 0x4c, 0x4c);
+pub const BORDER: Color32 = Color32::from_rgb(0x44, 0x44, 0x44); // visible on CONTROL too
+pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x4e, 0x4e, 0x4e);
 
 // Text.
-pub const TEXT: Color32 = Color32::from_rgb(0xe6, 0xe9, 0xef);
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x9a, 0xa2, 0xb1);
-pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x6b, 0x73, 0x80);
+pub const TEXT: Color32 = Color32::from_rgb(0xec, 0xec, 0xec);
+pub const TEXT_MUTED: Color32 = Color32::from_rgb(0xa8, 0xa8, 0xa8);
+pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x92, 0x92, 0x92); // 4.6:1 on CARD
+
+// Glyph tile on shortcut rows: grey tile, blue glyph (the icon's blue).
+pub const TILE_FILL: Color32 = Color32::from_rgb(0x36, 0x36, 0x36);
 
 // Accent (the icon's blue) and status colours.
 pub const ACCENT: Color32 = Color32::from_rgb(0x3d, 0x8b, 0xff);
@@ -350,7 +354,7 @@ pub fn list_row<R>(
     }
     if let Some(g) = glyph {
         let tile = Rect::from_center_size(Pos2::new(x + TILE / 2.0, rect.center().y), Vec2::splat(TILE));
-        p.rect_filled(tile, CornerRadius::same(7), ACCENT.gamma_multiply(0.16));
+        p.rect_filled(tile, CornerRadius::same(7), TILE_FILL);
         paint_glyph(&p, tile.shrink(6.0), g, ACCENT_HOVER);
         x += TILE + 12.0;
     }
